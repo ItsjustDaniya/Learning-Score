@@ -7,7 +7,7 @@ into a Google Sheet — built to slot alongside your existing GitHub Actions
 crons (Module_contest pipeline / Data Pipeline Automation), reusing the same
 auth, retry, and Sheets-writing patterns so it can live in the same repo.
 
-FIXED SINCE THE FIRST RUN (2026-09-15 GitHub Actions failure):
+FIXED SINCE THE FIRST RUN (2026-09-15 GitHub Actions failures):
   - Card #8646 turned out to be lecture-level, not user-level (confirmed from
     the actual error: columns were lecture_id/batch_strength/overall_viewers/
     etc, no user_id) — swapped attendance to card #11636
@@ -20,6 +20,16 @@ FIXED SINCE THE FIRST RUN (2026-09-15 GitHub Actions failure):
     has a `Date` template-tag filter on assignment release date — this
     script now passes that parameter explicitly so each month's tab reflects
     assignments released that month, not an all-time cumulative number.
+  - Card #11636's actual output has 'overall_attendance' (0/100, already
+    scaled), not 'overall_attended_flag' as first assumed — confirmed from
+    the second run's real column list. Fixed to use overall_attendance.
+  - Groomers/Master Data sheet ID now wired in
+    (13HWMhfMX3i5qsDCEYnQD1h1iFL-ScoNz0HQSgd4CIks) — but I still don't know
+    its tab name or column names, so build_placement_tags() falls back to
+    the first tab and auto-detects a user_id-like column; it prints every
+    column name it finds on each run so you can tell me the real join column
+    if "user_id" isn't it. ⚠ Share this sheet with the service account email
+    too (see ENV CHECK output) or it won't be readable.
 
 STILL OPEN — fix these before trusting the numbers:
 
@@ -36,13 +46,10 @@ STILL OPEN — fix these before trusting the numbers:
      `'%agentic%'`) — if your Learning Score cohort includes those tracks,
      their attendance will come back null. Flag if so and I'll find/build an
      unfiltered version.
-  4. Placement Profile Tags (Grooming Pool Tag, Career Expectations,
-     Location constraints, Grooming Level, Supply/Demand tag, Stack-wise
-     rating) come from the "Groomers and Master Data 2026" Google Sheet you
-     mentioned — I don't have its Sheet ID or tab/column names. Set
-     GROOMERS_SHEET_KEY / GROOMERS_SHEET_TAB below once you have them;
-     until then this section is skipped (composite score excludes it, same
-     as it does today).
+  4. Placement Profile Tags — sheet ID is wired (see above) but tab/column
+     names are still unverified; check the "📋 Groomers sheet tab..." log
+     line on the next run and tell me if the auto-detected join column is
+     wrong.
 
 Everything else (roster, attendance, assignments, module contests, projects,
 grooming-session count) is now verified against actual Metabase query
@@ -86,10 +93,17 @@ SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON")
 DEFAULT_LEARNING_SCORE_SHEET_KEY = "1AJZnBpHeE85eDYWNsj-Kz91PSyG0uo8iP8PQwRsS3vU"
 LEARNING_SCORE_SHEET_KEY = os.getenv("LEARNING_SCORE_SHEET_KEY", DEFAULT_LEARNING_SCORE_SHEET_KEY)
 
-# Optional: the "Groomers and Master Data 2026" sheet, once you have its ID.
-# Placement Profile Tags are skipped (not an error) if this is unset.
-GROOMERS_SHEET_KEY = os.getenv("GROOMERS_SHEET_KEY")
-GROOMERS_SHEET_TAB = os.getenv("GROOMERS_SHEET_TAB", "Master Data")
+# "Groomers and Master Data 2026" sheet:
+# https://docs.google.com/spreadsheets/d/13HWMhfMX3i5qsDCEYnQD1h1iFL-ScoNz0HQSgd4CIks/
+# Defaulted here too, same as the Learning Score sheet — still overridable.
+# ⚠ Also needs to be shared (at least Viewer) with the service account email.
+# GROOMERS_SHEET_TAB is intentionally left unset by default: I don't know the
+# real tab name, so build_placement_tags() falls back to "whichever tab is
+# first" rather than guessing a name that might not exist. Set
+# GROOMERS_SHEET_TAB explicitly once you know which tab holds the data.
+DEFAULT_GROOMERS_SHEET_KEY = "13HWMhfMX3i5qsDCEYnQD1h1iFL-ScoNz0HQSgd4CIks"
+GROOMERS_SHEET_KEY = os.getenv("GROOMERS_SHEET_KEY", DEFAULT_GROOMERS_SHEET_KEY)
+GROOMERS_SHEET_TAB = os.getenv("GROOMERS_SHEET_TAB")  # None = use the first tab
 
 # "previous" (default) scores last calendar month — run this on/after the
 # 1st and it scores the month that just ended. "current" scores month-to-date.
@@ -119,7 +133,7 @@ print("🔎 ENV CHECK")
 print(f"   Metabase API key   : {'[SET]' if METABASE_API_KEY else '[MISSING]'}")
 print(f"   SA client_email    : {service_info.get('client_email')}  (share both Sheets with this)")
 print(f"   Learning Score sheet: {LEARNING_SCORE_SHEET_KEY}")
-print(f"   Groomers sheet      : {GROOMERS_SHEET_KEY or '[not set — Placement Profile Tags will be skipped]'}")
+print(f"   Groomers sheet      : {GROOMERS_SHEET_KEY} (tab: {GROOMERS_SHEET_TAB or '[first tab]'})")
 
 # Transport-level retries for transient network blips, same as your existing scripts
 SESSION = requests.Session()
@@ -348,7 +362,11 @@ def build_roster():
 def build_attendance(y, m):
     df = fetch_card_df(ATTENDANCE_CARD, "attendance (11636)", require_user_id=True)
 
-    required = {"lecture_id", "lecture_start_timestamp", "overall_attended_flag", "time_spent_mins"}
+    # Confirmed against the actual run's error output (2026-09-15): the card
+    # emits 'overall_attendance' (already scaled 0/100 — overall_attended_flag
+    # itself is NOT in the output, only live_attended_flag is raw), not
+    # 'overall_attended_flag' as first assumed. Using the real column name now.
+    required = {"lecture_id", "lecture_start_timestamp", "overall_attendance", "time_spent_mins"}
     missing_cols = required - set(df.columns)
     if missing_cols:
         raise RuntimeError(
@@ -365,7 +383,7 @@ def build_attendance(y, m):
 
     out = df.groupby("user_id").agg(
         sessions_in_scope=("lecture_id", "nunique"),
-        no_of_attended=("overall_attended_flag", "sum"),
+        no_of_attended=("overall_attendance", lambda s: (s == 100).sum()),
         avg_time=("time_spent_mins", "mean"),
     ).reset_index()
     out["attendance_score"] = (out["no_of_attended"] / out["sessions_in_scope"]).clip(0, 1) * 100
@@ -553,14 +571,20 @@ def build_placement_tags():
         return None
     try:
         sheet = gc.open_by_key(GROOMERS_SHEET_KEY)
-        ws = sheet.worksheet(GROOMERS_SHEET_TAB)
+        # No confirmed tab name yet — use the tab explicitly set via
+        # GROOMERS_SHEET_TAB if you've set one, otherwise whichever tab is
+        # first, rather than guessing a name that might not exist.
+        ws = sheet.worksheet(GROOMERS_SHEET_TAB) if GROOMERS_SHEET_TAB else sheet.get_worksheet(0)
         records = ws.get_all_records()
         df = pd.DataFrame(records)
-        if "user_id" not in df.columns:
-            print(f"⚠️  Groomers sheet tab '{GROOMERS_SHEET_TAB}' has no user_id column — "
-                  f"columns were: {list(df.columns)}. Update build_placement_tags() to match "
-                  f"the real column names once you share them.")
+        print(f"📋 Groomers sheet tab '{ws.title}': {len(df)} rows, columns: {list(df.columns)}")
+        user_col = next((c for c in df.columns if c.lower().replace(" ", "_") in ("user_id", "userid")), None)
+        if user_col is None:
+            print(f"⚠️  No obvious user_id column in tab '{ws.title}' — columns were: {list(df.columns)}. "
+                  f"Tell me the real join column (user_id? email? student name?) and I'll wire it up.")
             return None
+        if user_col != "user_id":
+            df = df.rename(columns={user_col: "user_id"})
         return df
     except Exception as e:
         print(f"⚠️  Could not read Groomers sheet: {e}")
