@@ -38,6 +38,32 @@ FIXED SINCE THE FIRST RUN (2026-09-15 GitHub Actions failures):
     the "Newton School" DB's users_userprofile table, NOT the Data-Science-DB
     one, which has no phone column at all). build_roster() now keeps those
     columns and they flow straight into the final merged sheet.
+  - Added a Placement Correlation step, run at the end of every monthly cron
+    run (per your instruction — this is now recurring, not one-off). Pulls
+    from the "Placements - FlyWheel" Google Sheet
+    (1Ue49enEEpgNaOEdQVgwgsehWvHb3HEI0Q-qekvAzYyU), using BOTH tabs you
+    confirmed: "Student_Tags" (one row per user_id, clean "Placement Tag" →
+    is_placed) and "Prog<>Placement" (one row per user_id too, wider — adds
+    LPA/compensation + placement month for the placed subset). I looked at
+    both tabs directly in your browser (you declined sharing this sheet with
+    the service account, so I read it visually instead — no other way to get
+    a sheet this size in short of that). Since placement is a lagging
+    outcome, the correlation uses each student's AVERAGE learning_score
+    across every monthly tab this cron has ever written (not just this
+    month's snapshot) — see collect_historical_learning_scores(). Writes 3
+    new evergreen tabs (overwritten each run, not one per month):
+    "Placement Correlation - Summary" (Pearson r of each avg sub-score vs.
+    is_placed, and vs. LPA for the placed subset), "... - By Score Bucket"
+    (placement rate % per 20-point learning_score band), and
+    "... - Detail" (the merged per-user table those are computed from).
+    ⚠ I derived STUDENT_TAGS_TAB/PROG_PLACEMENT_TAB's exact columns from a
+    live look at the sheet on 2026-09-15, not a schema I can re-verify
+    programmatically — build_student_tags()/build_prog_placement_detail()
+    print every column name they find each run, and this whole step is
+    wrapped so it can't fail the core Learning Score write if the sheet's
+    layout ever changes. ⚠ This sheet MUST be shared (at least Viewer) with
+    the service account email (see ENV CHECK) or every read here returns
+    nothing — silently, since this step is non-fatal by design.
 
 STILL OPEN — fix these before trusting the numbers:
 
@@ -58,12 +84,21 @@ STILL OPEN — fix these before trusting the numbers:
      names are still unverified; check the "📋 Groomers sheet tab..." log
      line on the next run and tell me if the auto-detected join column is
      wrong.
+  5. Placement Correlation (new) — STUDENT_TAGS_TAB/PROG_PLACEMENT_TAB column
+     names were read visually, not verified against a live query/json pull
+     like everything else in this file, since the sheet was never shared
+     with the service account for me to hit programmatically. Share it (see
+     PLACEMENTS_SHEET_KEY block above) and check the "📋 '...' tab: ... rows,
+     columns: [...]" log lines on the next run — if is_placed / lpa /
+     placement_month come back empty, paste me those column lists and I'll
+     fix the lookups.
 
 Everything else (roster, attendance, assignments, module contests, projects,
 grooming-session count) is now verified against actual Metabase query
 definitions or your two production scripts' real output — see CARD IDS below.
 """
 import os
+import re
 import sys
 import json
 import time
@@ -113,6 +148,27 @@ DEFAULT_GROOMERS_SHEET_KEY = "13HWMhfMX3i5qsDCEYnQD1h1iFL-ScoNz0HQSgd4CIks"
 GROOMERS_SHEET_KEY = os.getenv("GROOMERS_SHEET_KEY", DEFAULT_GROOMERS_SHEET_KEY)
 GROOMERS_SHEET_TAB = os.getenv("GROOMERS_SHEET_TAB")  # None = use the first tab
 
+# "Placements - FlyWheel" sheet:
+# https://docs.google.com/spreadsheets/d/1Ue49enEEpgNaOEdQVgwgsehWvHb3HEI0Q-qekvAzYyU/
+# Used for the Placement Correlation step at the end of the run. Two tabs,
+# confirmed by looking at the sheet directly (2026-09-15) — both are already
+# one row per user_id, no de-dup needed:
+#   - Student_Tags: clean "Placement Tag" column (Placed / Current enrolled /
+#     Not In grooming / Refund Request / ...) → the primary is_placed signal.
+#   - Prog<>Placement: much wider (~60 cols); adds LPA (compensation) and
+#     Placement Month for the placed subset, plus its own free-text "Placed"
+#     status as a cross-check. ⚠ Its real header row is ROW 2, not row 1 (row
+#     1 has merged section-group labels + a stray #REF! cell) — handled in
+#     build_prog_placement_detail(), not with the usual get_all_records().
+# ⚠ Share this sheet (at least Viewer) with the service account email too
+#   (see ENV CHECK) or the Placement Correlation tabs will just come back
+#   empty — this step is intentionally non-fatal, so a run without sharing
+#   still writes the core Learning Score tab fine, it just skips these 3.
+DEFAULT_PLACEMENTS_SHEET_KEY = "1Ue49enEEpgNaOEdQVgwgsehWvHb3HEI0Q-qekvAzYyU"
+PLACEMENTS_SHEET_KEY = os.getenv("PLACEMENTS_SHEET_KEY", DEFAULT_PLACEMENTS_SHEET_KEY)
+STUDENT_TAGS_TAB = os.getenv("STUDENT_TAGS_TAB", "Student_Tags")
+PROG_PLACEMENT_TAB = os.getenv("PROG_PLACEMENT_TAB", "Prog<>Placement")
+
 # "previous" (default) scores last calendar month — run this on/after the
 # 1st and it scores the month that just ended. "current" scores month-to-date.
 RUN_MONTH_MODE = os.getenv("RUN_MONTH_MODE", "previous")
@@ -142,6 +198,7 @@ print(f"   Metabase API key   : {'[SET]' if METABASE_API_KEY else '[MISSING]'}")
 print(f"   SA client_email    : {service_info.get('client_email')}  (share both Sheets with this)")
 print(f"   Learning Score sheet: {LEARNING_SCORE_SHEET_KEY}")
 print(f"   Groomers sheet      : {GROOMERS_SHEET_KEY} (tab: {GROOMERS_SHEET_TAB or '[first tab]'})")
+print(f"   Placements sheet    : {PLACEMENTS_SHEET_KEY} (tabs: '{STUDENT_TAGS_TAB}' + '{PROG_PLACEMENT_TAB}')")
 
 # Transport-level retries for transient network blips, same as your existing scripts
 SESSION = requests.Session()
@@ -642,6 +699,303 @@ def build_placement_tags():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# PLACEMENT CORRELATION — pulls from the "Placements - FlyWheel" sheet and
+# correlates each learning-score sub-metric against placement outcomes.
+# Entirely optional/non-fatal: every function here returns None on any
+# problem rather than raising, and the __main__ block wraps the whole step
+# in a try/except so a bad column name or an unshared sheet can never take
+# down the core Learning Score write.
+# ═══════════════════════════════════════════════════════════════════════════
+def _dedupe_header(header):
+    """Turns a raw header row into unique column names — needed for the
+    Prog<>Placement tab, whose row 2 (its real header) has a few blank cells
+    (collapsed/grouped columns) that would otherwise collide as ''."""
+    seen = {}
+    out = []
+    for h in header:
+        h = (h or "").strip() or "_blank"
+        if h in seen:
+            seen[h] += 1
+            h = f"{h}_{seen[h]}"
+        else:
+            seen[h] = 0
+        out.append(h)
+    return out
+
+
+def _find_col(norm_map, substr):
+    """norm_map: {original_col_name: normalized_lowercase_no_space_name}.
+    Returns the first original column name whose normalized form contains
+    `substr`, or None."""
+    for c, n in norm_map.items():
+        if substr in n:
+            return c
+    return None
+
+
+def build_student_tags():
+    """Student_Tags tab of the Placements sheet — one row per user_id, with
+    a clean "Placement Tag" column (Placed / Current enrolled / Not In
+    grooming / Refund Request / ...). This is the primary is_placed signal —
+    confirmed by eye to already be one row per student, standard header on
+    row 1, so get_all_records() works as-is (unlike Prog<>Placement below)."""
+    if not PLACEMENTS_SHEET_KEY:
+        return None
+    try:
+        sheet = gc.open_by_key(PLACEMENTS_SHEET_KEY)
+        ws = sheet.worksheet(STUDENT_TAGS_TAB)
+        records = ws.get_all_records()
+        if not records:
+            print(f"⚠️  '{STUDENT_TAGS_TAB}' tab is empty.")
+            return None
+        df = pd.DataFrame(records)
+        print(f"📋 '{STUDENT_TAGS_TAB}' tab: {len(df)} rows, columns: {list(df.columns)}")
+
+        norm = {c: str(c).strip().lower().replace(" ", "").replace("_", "") for c in df.columns}
+        user_col = _find_col(norm, "userid")
+        tag_col = _find_col(norm, "placementtag")
+        if user_col is None:
+            print(f"⚠️  No user_id column found in '{STUDENT_TAGS_TAB}' — columns were: {list(df.columns)}. Skipping.")
+            return None
+
+        out = pd.DataFrame({"user_id": pd.to_numeric(df[user_col], errors="coerce")})
+        out = out[out["user_id"].notna()].copy()
+        out["user_id"] = out["user_id"].astype(int)
+
+        if tag_col:
+            tag = df.loc[out.index, tag_col].astype(str).str.strip()
+            out["placement_tag"] = tag
+            out["is_placed"] = (tag.str.lower() == "placed").astype(int)
+        else:
+            print(f"⚠️  No 'Placement Tag' column found in '{STUDENT_TAGS_TAB}' — columns were: {list(df.columns)}.")
+
+        for label, substr in [
+            ("eligibility_level", "eligibilitylevel"),
+            ("phase", "phase"),
+            ("enrolled_status", "enrolledstatus"),
+        ]:
+            c = _find_col(norm, substr)
+            if c:
+                out[label] = df.loc[out.index, c]
+
+        return out.drop_duplicates(subset="user_id")
+    except gspread.exceptions.WorksheetNotFound:
+        print(f"⚠️  Tab '{STUDENT_TAGS_TAB}' not found in Placements sheet (checked STUDENT_TAGS_TAB) — skipping is_placed.")
+        return None
+    except Exception as e:
+        print(f"⚠️  Could not read '{STUDENT_TAGS_TAB}' tab: {e}")
+        return None
+
+
+def build_prog_placement_detail():
+    """Prog<>Placement tab of the Placements sheet — also one row per
+    user_id (confirmed by eye, ~3,661 rows), but its real header is on ROW 2,
+    not row 1 (row 1 has merged section-group labels like "Grooming"/"PR"/
+    "Placement"/"Debarred" plus a stray #REF! cell), so get_all_records()
+    (which assumes row 1) would silently misread it — this reads raw values
+    and builds the header from row 2 itself. Adds LPA (compensation) and
+    Placement Month for the placed subset, plus its own free-text "Placed"
+    status column (e.g. "Placed - NS ...", "Placed - Self (...)", "Placed
+    once; now returned") as a cross-check against Student_Tags."""
+    if not PLACEMENTS_SHEET_KEY:
+        return None
+    try:
+        sheet = gc.open_by_key(PLACEMENTS_SHEET_KEY)
+        ws = sheet.worksheet(PROG_PLACEMENT_TAB)
+        values = ws.get_all_values()
+        if len(values) < 3:
+            print(f"⚠️  '{PROG_PLACEMENT_TAB}' tab has too few rows (header expected on row 2) — skipping.")
+            return None
+        header = _dedupe_header(values[1])
+        rows = [r + [""] * (len(header) - len(r)) for r in values[2:]]  # pad short rows
+        df = pd.DataFrame(rows, columns=header)
+        print(f"📋 '{PROG_PLACEMENT_TAB}' tab: {len(df)} rows, columns: {list(df.columns)}")
+
+        norm = {c: str(c).strip().lower().replace(" ", "") for c in df.columns}
+        user_col = _find_col(norm, "userid")
+        placed_col = _find_col(norm, "placed")
+        lpa_col = _find_col(norm, "lpa")
+        month_col = _find_col(norm, "placementmonth")
+
+        if user_col is None:
+            print(f"⚠️  No UserID column found in '{PROG_PLACEMENT_TAB}' — columns were: {list(df.columns)}. Skipping.")
+            return None
+
+        out = pd.DataFrame({"user_id": pd.to_numeric(df[user_col], errors="coerce")})
+        out = out[out["user_id"].notna()].copy()
+        out["user_id"] = out["user_id"].astype(int)
+
+        if placed_col:
+            placed_text = df.loc[out.index, placed_col].astype(str).str.strip()
+            out["placed_status_detail"] = placed_text
+            out["is_placed_detail"] = placed_text.str.lower().str.startswith("placed").astype(int)
+        if lpa_col:
+            out["lpa"] = pd.to_numeric(df.loc[out.index, lpa_col], errors="coerce")
+        if month_col:
+            out["placement_month"] = df.loc[out.index, month_col]
+
+        if not any([placed_col, lpa_col, month_col]):
+            print(f"⚠️  Found no Placed/LPA/Placement Month columns in '{PROG_PLACEMENT_TAB}' — "
+                  f"columns were: {list(df.columns)}. Tell me the real names and I'll fix the lookup.")
+
+        return out.drop_duplicates(subset="user_id")
+    except gspread.exceptions.WorksheetNotFound:
+        print(f"⚠️  Tab '{PROG_PLACEMENT_TAB}' not found in Placements sheet (checked PROG_PLACEMENT_TAB) — skipping LPA/placement month.")
+        return None
+    except Exception as e:
+        print(f"⚠️  Could not read '{PROG_PLACEMENT_TAB}' tab: {e}")
+        return None
+
+
+def build_placement_outcomes():
+    """Combines both Placements-sheet tabs, per your instruction to use both:
+    Student_Tags for the primary is_placed flag, Prog<>Placement for LPA +
+    placement month (and a cross-check status). Joined on user_id."""
+    tags = build_student_tags()
+    detail = build_prog_placement_detail()
+    if tags is None and detail is None:
+        return None
+    if tags is None:
+        return detail
+    if detail is None:
+        return tags
+    out = pd.merge(tags, detail, on="user_id", how="outer")
+    if "is_placed" in out.columns and "is_placed_detail" in out.columns:
+        # Trust Student_Tags' cleaner flag; fall back to the Prog<>Placement
+        # text-status flag only for users Student_Tags didn't have.
+        out["is_placed"] = out["is_placed"].fillna(out["is_placed_detail"])
+    elif "is_placed_detail" in out.columns:
+        out["is_placed"] = out["is_placed_detail"]
+    return out
+
+
+def collect_historical_learning_scores():
+    """Reads every monthly Learning Score tab this cron has ever written
+    (e.g. "Sep-2026") back out of the sheet and averages each user's scores
+    across all months they appear in. Placement is a lagging, slow-changing
+    outcome — correlating it against a single month's snapshot score would be
+    noisy, so this uses the fullest history available (every month run so
+    far, including the one this run just wrote) rather than just this run's
+    numbers. Module-Contests-per-module tabs and the Placement Correlation
+    tabs themselves are excluded by the tab-name pattern (month tabs are
+    exactly "Mon-YYYY", nothing else matches)."""
+    sheet = gc.open_by_key(LEARNING_SCORE_SHEET_KEY)
+    month_tab_re = re.compile(r"^[A-Za-z]{3}-\d{4}$")
+    frames = []
+    for ws in sheet.worksheets():
+        if not month_tab_re.match(ws.title):
+            continue
+        try:
+            records = ws.get_all_records()
+        except Exception as e:
+            print(f"⚠️  Could not read tab '{ws.title}' for history: {e}")
+            continue
+        if not records:
+            continue
+        df = pd.DataFrame(records)
+        if "user_id" not in df.columns:
+            continue
+        df["_source_tab"] = ws.title
+        frames.append(df)
+
+    if not frames:
+        print("⚠️  No monthly Learning Score tabs found yet — can't build placement-correlation history.")
+        return None
+
+    all_months = pd.concat(frames, axis=0, ignore_index=True, sort=False)
+    all_months["user_id"] = pd.to_numeric(all_months["user_id"], errors="coerce")
+    all_months = all_months[all_months["user_id"].notna()].copy()
+    all_months["user_id"] = all_months["user_id"].astype(int)
+
+    score_cols = [c for c in [
+        "attendance_score", "assignment_score", "module_contest_score",
+        "project_score", "arena_score", "session_score", "learning_score",
+    ] if c in all_months.columns]
+    for c in score_cols:
+        all_months[c] = pd.to_numeric(all_months[c], errors="coerce")
+
+    agg = all_months.groupby("user_id")[score_cols].mean().reset_index()
+    agg = agg.rename(columns={c: f"avg_{c}" for c in score_cols})
+
+    months_seen = all_months.groupby("user_id")["_source_tab"].nunique().reset_index(name="months_tracked")
+    agg = agg.merge(months_seen, on="user_id", how="left")
+
+    name_col = next((c for c in ["student_name", "email"] if c in all_months.columns), None)
+    if name_col:
+        first_name = all_months.groupby("user_id")[name_col].first().reset_index()
+        agg = agg.merge(first_name, on="user_id", how="left")
+
+    print(f"📊 Learning Score history: {len(agg)} users across {len(frames)} monthly tab(s).")
+    return agg
+
+
+def compute_placement_correlation(history_df, outcomes_df):
+    """Returns (summary, score_bucket_pivot, detail) — all None if either
+    input is missing/empty or there's no overlap between the two sheets'
+    user_ids. summary = Pearson r of each avg_* sub-score against is_placed
+    (0/1 — mathematically identical to point-biserial correlation for a
+    binary variable, so no extra stats dependency needed) and, for the
+    placed subset, against LPA. score_bucket_pivot = placement rate % per
+    20-point avg_learning_score band, the plainest "does a higher score mean
+    a better placement shot" read of the same data."""
+    if history_df is None or outcomes_df is None:
+        print("⚠️  Skipping placement correlation — missing Learning Score history or Placements data.")
+        return None, None, None
+
+    detail = pd.merge(history_df, outcomes_df, on="user_id", how="inner")
+    if detail.empty:
+        print("⚠️  No overlapping user_ids between Learning Score history and the Placements sheet — nothing to correlate.")
+        return None, None, None
+    if "is_placed" not in detail.columns:
+        print("⚠️  No is_placed column resolved from the Placements sheet — can't compute correlation.")
+        return None, None, detail
+
+    detail["is_placed"] = pd.to_numeric(detail["is_placed"], errors="coerce")
+    metric_cols = [c for c in detail.columns if c.startswith("avg_")]
+
+    rows = []
+    for col in metric_cols:
+        s = pd.to_numeric(detail[col], errors="coerce")
+        row = {"metric": col}
+        pair = pd.concat([s, detail["is_placed"]], axis=1).dropna()
+        row["n_vs_placed"] = len(pair)
+        row["corr_vs_is_placed"] = pair.iloc[:, 0].corr(pair.iloc[:, 1]) if len(pair) > 2 else np.nan
+        if "lpa" in detail.columns:
+            placed_mask = detail["is_placed"] == 1
+            pair2 = pd.concat([s[placed_mask], detail.loc[placed_mask, "lpa"]], axis=1).dropna()
+            row["n_vs_lpa"] = len(pair2)
+            row["corr_vs_lpa"] = pair2.iloc[:, 0].corr(pair2.iloc[:, 1]) if len(pair2) > 2 else np.nan
+        rows.append(row)
+    summary = pd.DataFrame(rows)
+
+    bucket_df = pd.DataFrame()
+    if "avg_learning_score" in detail.columns:
+        bins = [0, 20, 40, 60, 80, 100.0001]
+        labels = ["0-20", "20-40", "40-60", "60-80", "80-100"]
+        detail["score_bucket"] = pd.cut(
+            pd.to_numeric(detail["avg_learning_score"], errors="coerce"), bins=bins, labels=labels, right=False
+        )
+        bucket_rows = []
+        for bucket, g in detail.groupby("score_bucket", observed=False):
+            n = len(g)
+            n_placed = int(g["is_placed"].sum()) if n else 0
+            avg_lpa = (
+                pd.to_numeric(g.loc[g["is_placed"] == 1, "lpa"], errors="coerce").mean()
+                if "lpa" in g.columns else np.nan
+            )
+            bucket_rows.append({
+                "score_bucket": str(bucket),
+                "n_students": n,
+                "n_placed": n_placed,
+                "placement_rate_pct": round(100 * n_placed / n, 1) if n else np.nan,
+                "avg_lpa_if_placed": round(avg_lpa, 2) if pd.notna(avg_lpa) else np.nan,
+            })
+        bucket_df = pd.DataFrame(bucket_rows)
+
+    return summary, bucket_df, detail
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # COMPOSITE SCORE
 # ═══════════════════════════════════════════════════════════════════════════
 # Category weights, as agreed — tune freely, they're read fresh each run.
@@ -738,6 +1092,24 @@ if __name__ == "__main__":
 
         write_sheet(LEARNING_SCORE_SHEET_KEY, tab_name, df)
         write_sheet(LEARNING_SCORE_SHEET_KEY, f"{tab_name} - Module Contests (per module)", per_module_contests)
+
+        # ─── Placement correlation — recurring, evergreen tabs (not per-month) ───
+        # Non-fatal by design: a problem here (sheet not shared, tab renamed,
+        # etc.) is printed as a warning, never fails the run — the core
+        # Learning Score tab above is already safely written by this point.
+        try:
+            history = collect_historical_learning_scores()
+            outcomes = build_placement_outcomes()
+            corr_summary, corr_buckets, corr_detail = compute_placement_correlation(history, outcomes)
+            if corr_summary is not None and not corr_summary.empty:
+                write_sheet(LEARNING_SCORE_SHEET_KEY, "Placement Correlation - Summary", corr_summary)
+            if corr_buckets is not None and not corr_buckets.empty:
+                write_sheet(LEARNING_SCORE_SHEET_KEY, "Placement Correlation - By Score Bucket", corr_buckets)
+            if corr_detail is not None and not corr_detail.empty:
+                write_sheet(LEARNING_SCORE_SHEET_KEY, "Placement Correlation - Detail", corr_detail)
+        except Exception:
+            print("\n⚠️  Placement correlation step failed (Learning Score tabs above were still written OK):")
+            traceback.print_exc()
 
         elapsed = time.time() - start_time
         print(f"\n🎯 Done in {int(elapsed // 60)}m {int(elapsed % 60)}s — {len(df)} users scored for {tab_name}.")
