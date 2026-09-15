@@ -30,6 +30,14 @@ FIXED SINCE THE FIRST RUN (2026-09-15 GitHub Actions failures):
     column name it finds on each run so you can tell me the real join column
     if "user_id" isn't it. ⚠ Share this sheet with the service account email
     too (see ENV CHECK output) or it won't be readable.
+  - Added student_name / email / phone to the output. No new card needed —
+    the roster card (#6289) already selects
+    concat(first_name,' ',last_name) as student_name, auth_user.email, and
+    users_userprofile.phone in its own saved SQL (verified via
+    metabase://question/6289 + metabase://table/211/fields — phone lives on
+    the "Newton School" DB's users_userprofile table, NOT the Data-Science-DB
+    one, which has no phone column at all). build_roster() now keeps those
+    columns and they flow straight into the final merged sheet.
 
 STILL OPEN — fix these before trusting the numbers:
 
@@ -364,7 +372,33 @@ def in_target_month(series, y, m):
 def build_roster():
     df = fetch_card_df(ROSTER_CARD, "roster (6289)", require_user_id=True)
     df = df[df["label"].isin(["Enrolled", "DS Advantage", "Advantage +"])]
-    keep = [c for c in ["user_id", "au_batch_name", "label", "gem_label"] if c in df.columns]
+
+    # Card #6289's own saved SQL already selects everything needed for
+    # contact info — no extra card/query required:
+    #   concat(auth_user.first_name,' ',auth_user.last_name) as student_name
+    #   auth_user.username
+    #   auth_user.email                  (selected twice in the SQL — Metabase
+    #                                      may come back as "email"/"email_2",
+    #                                      both handled below)
+    #   users_userprofile.phone
+    # (verified via metabase://question/6289's saved query_json — this is the
+    # same "Newton School" DB / users_userprofile.phone confirmed to exist via
+    # metabase://table/211/fields; the Data-Science-DB users_userprofile table
+    # at id 11394 does NOT have phone, so this roster card is the right source.)
+    if "email" not in df.columns and "email_2" in df.columns:
+        df = df.rename(columns={"email_2": "email"})
+    elif "email_2" in df.columns:
+        df = df.drop(columns=["email_2"])  # duplicate of "email", drop it
+
+    keep = [c for c in [
+        "user_id", "student_name", "username", "email", "phone",
+        "au_batch_name", "label", "gem_label",
+    ] if c in df.columns]
+    missing_contact = {"student_name", "email", "phone"} - set(keep)
+    if missing_contact:
+        print(f"⚠️  Roster card {ROSTER_CARD} is missing expected contact column(s) "
+              f"{missing_contact} this run — columns were: {list(df.columns)}. "
+              f"Name/email/phone will be blank for everyone until this is fixed.")
     return df[keep].drop_duplicates(subset="user_id")
 
 
