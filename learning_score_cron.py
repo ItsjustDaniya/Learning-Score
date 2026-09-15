@@ -7,8 +7,21 @@ into a Google Sheet — built to slot alongside your existing GitHub Actions
 crons (Module_contest pipeline / Data Pipeline Automation), reusing the same
 auth, retry, and Sheets-writing patterns so it can live in the same repo.
 
-WHAT THIS DOES NOT YET KNOW (fix these before the first real run — see the
-"NEEDS YOUR CONFIRMATION" block below for the full list):
+FIXED SINCE THE FIRST RUN (2026-09-15 GitHub Actions failure):
+  - Card #8646 turned out to be lecture-level, not user-level (confirmed from
+    the actual error: columns were lecture_id/batch_strength/overall_viewers/
+    etc, no user_id) — swapped attendance to card #11636
+    (user_level_lecture_level_attendance_time_spent), which IS genuinely
+    user+lecture-level (verified via its saved query) and needed no merge
+    with #6031 at all. #6031 is no longer fetched.
+  - Card #7939 was flagged as a risk (used batch-wise in your existing
+    pipeline) but its saved query confirms it IS user-level
+    (user_id/users_completion_rate/users_completion_rate_on_time). It also
+    has a `Date` template-tag filter on assignment release date — this
+    script now passes that parameter explicitly so each month's tab reflects
+    assignments released that month, not an all-time cumulative number.
+
+STILL OPEN — fix these before trusting the numbers:
 
   1. Arena / Playlist section has NO confirmed source card. Your two existing
      pipelines never pull it. `build_arena()` is a stub that raises
@@ -18,10 +31,11 @@ WHAT THIS DOES NOT YET KNOW (fix these before the first real run — see the
      either of your existing pipelines (which have mentor-ops cards 7019 /
      6161 / 6184 / 7941 / 6167 instead, all mentor-centric rather than
      obviously "sessions a student attended"). Confirm or swap.
-  3. Card #7939 (assignments) is used batch/module-wise in your existing
-     pipeline, never merged to user_id — this script ASSERTS it has a
-     user_id column and raises immediately with a clear message if not,
-     rather than silently producing batch-level rows under a per-user score.
+  3. Card #11636 (attendance) explicitly EXCLUDES batches with "advantage" or
+     "agentic" in the name (`au_batch_name NOT ILIKE '%advantage%'` /
+     `'%agentic%'`) — if your Learning Score cohort includes those tracks,
+     their attendance will come back null. Flag if so and I'll find/build an
+     unfiltered version.
   4. Placement Profile Tags (Grooming Pool Tag, Career Expectations,
      Location constraints, Grooming Level, Supply/Demand tag, Stack-wise
      rating) come from the "Groomers and Master Data 2026" Google Sheet you
@@ -30,10 +44,9 @@ WHAT THIS DOES NOT YET KNOW (fix these before the first real run — see the
      until then this section is skipped (composite score excludes it, same
      as it does today).
 
-Everything else (roster, attendance, assignments-if-user-level, module
-contests, projects, grooming-session count) is wired to the same card IDs
-your two production scripts already use — see CARD IDS below for exactly
-which ones and why.
+Everything else (roster, attendance, assignments, module contests, projects,
+grooming-session count) is now verified against actual Metabase query
+definitions or your two production scripts' real output — see CARD IDS below.
 """
 import os
 import sys
@@ -126,12 +139,17 @@ ROSTER_CARD = 6289                 # Confirmed: used by every section in both ex
 CONTEST_MCQ_CARD = 8057            # Confirmed: Module_contest pipeline, MCQ scores per user/module.
 CONTEST_CODING_CARD = 6391         # Confirmed: Module_contest pipeline, coding scores per user/module.
 
-ATTENDANCE_LECTURES_CARD = 6031    # Confirmed: Data Pipeline, lecture calendar (lecture_id/date/course).
-ATTENDANCE_CARD = 8646             # Confirmed: Data Pipeline, "Batch-wise-Attendance" — ⚠ name suggests
-                                    # batch-level; asserted for user_id below, fails loudly if wrong.
+ATTENDANCE_CARD = 11636            # Confirmed via saved-query inspection: genuinely user+lecture-level.
+                                    # Columns include user_id, lecture_id, lecture_start_timestamp,
+                                    # overall_attended_flag, time_spent_mins, au_batch_name, gem_label.
+                                    # ⚠ excludes 'advantage'/'agentic' batches by name — see docstring #3.
+                                    # (#6031 + #8646, used previously, are no longer fetched — #8646
+                                    # turned out to be lecture-level only, no user_id.)
 
-ASSIGNMENTS_CARD = 7939            # ⚠ Used batch/module-wise only in the Data Pipeline script (never
-                                    # merged on user_id there). Asserted for user_id below.
+ASSIGNMENTS_CARD = 7939            # Confirmed via saved-query inspection: user-level. Has a `Date`
+                                    # template-tag on assignment release date — queried WITH that
+                                    # parameter set to the target month (see build_assignments()),
+                                    # NOT part of the blind concurrent prefetch below.
 
 PROJECTS_RAW_CARDS = (6241, 6242)  # Confirmed: Data Pipeline "Projects Raw" — user-level, has
                                     # Submission Time / marks_obtained / project_deadline_date.
@@ -146,9 +164,11 @@ TA_SESSIONS_CARD = 9251            # ⚠ BEST GUESS — not used by either exist
 
 ARENA_CARD = None                  # ⚠ NOT IDENTIFIED — see build_arena() below.
 
+# ASSIGNMENTS_CARD is deliberately excluded — it's fetched separately, with a
+# month-scoped Date parameter, inside build_assignments().
 REQUIRED_CARDS = [
     ROSTER_CARD, CONTEST_MCQ_CARD, CONTEST_CODING_CARD,
-    ATTENDANCE_LECTURES_CARD, ATTENDANCE_CARD, ASSIGNMENTS_CARD,
+    ATTENDANCE_CARD,
     *PROJECTS_RAW_CARDS, *PROJECT_EVAL_CARDS,
     GROOMING_SESSIONS_CARD, TA_SESSIONS_CARD,
 ]
@@ -175,18 +195,40 @@ MCQ_ONLY_MODULES = {"DS 03 Power BI", "DS 07 EDA 2"}
 _card_cache = {}
 
 
+def month_date_range_value(y, m):
+    """'YYYY-MM-01~YYYY-MM-DD' (last day of month) — the value format Metabase
+    expects for a date/range template-tag parameter."""
+    last_day = calendar.monthrange(y, m)[1]
+    return f"{y:04d}-{m:02d}-01~{y:04d}-{m:02d}-{last_day:02d}"
+
+
+def date_range_param(tag_name, y, m):
+    """A Metabase `parameters` entry that binds a date/range value to a
+    native-query template tag named `tag_name` (e.g. the `{{Date}}` tag on
+    card #7939). Pass this in fetch_card(..., parameters=[...]) for any card
+    that needs to be scoped to the target month server-side rather than
+    filtered client-side after the fact (necessary for cards — like 7939 —
+    that return pre-aggregated numbers with no row-level date to filter on)."""
+    return {
+        "type": "date/range",
+        "target": ["dimension", ["template-tag", tag_name]],
+        "value": month_date_range_value(y, m),
+    }
+
+
 def metabase_request(card_id, label=None, timeout=480, max_conn_retries=5,
-                      conn_backoff=30, max_conn_backoff=240):
+                      conn_backoff=30, max_conn_backoff=240, parameters=None):
     label = label or f"card {card_id}"
     url = f"{METABASE_BASE}/api/card/{card_id}/query/json"
+    body = {"parameters": parameters} if parameters else None
     backoff = conn_backoff
     for attempt in range(1, max_conn_retries + 1):
         time.sleep(2)
         suffix = f" (retry {attempt}/{max_conn_retries})" if attempt > 1 else ""
-        print(f"→ Fetching {label}{suffix}...")
+        print(f"→ Fetching {label}{suffix}{' with params' if parameters else ''}...")
         t0 = time.time()
         try:
-            res = SESSION.post(url, headers=METABASE_HEADERS, timeout=timeout)
+            res = SESSION.post(url, headers=METABASE_HEADERS, json=body, timeout=timeout)
         except requests.exceptions.Timeout:
             raise RuntimeError(f"⏱️ Timed out fetching {label} after {timeout}s ({url}).")
         except requests.exceptions.ConnectionError as e:
@@ -206,28 +248,30 @@ def metabase_request(card_id, label=None, timeout=480, max_conn_retries=5,
         return res
 
 
-def fetch_card(card_id, label=None, optional=False):
+def fetch_card(card_id, label=None, optional=False, parameters=None):
     label = label or f"card {card_id}"
-    if card_id in _card_cache:
+    cache_key = (card_id, json.dumps(parameters, sort_keys=True) if parameters else "")
+    if cache_key in _card_cache:
         print(f"↺ Reusing cached {label}")
-        return _card_cache[card_id]
+        return _card_cache[cache_key]
     try:
-        res = metabase_request(card_id, label)
+        res = metabase_request(card_id, label, parameters=parameters)
         data = res.json()
     except (RuntimeError, requests.exceptions.JSONDecodeError) as e:
         if optional:
             print(f"⚠️  {label} failed/empty and is being SKIPPED: {e}")
             return None
         raise
-    _card_cache[card_id] = data
+    _card_cache[cache_key] = data
     return data
 
 
-def fetch_card_df(card_id, label=None, optional=False, require_user_id=False):
+def fetch_card_df(card_id, label=None, optional=False, require_user_id=False, parameters=None):
     """fetch_card(), as a DataFrame, with an optional loud check that the
-    card is actually user-level (guards against #7939 / #8646 turning out
-    to be batch-level — see file docstring item 3)."""
-    data = fetch_card(card_id, label, optional=optional)
+    card is actually user-level — defense in depth in case a card gets
+    swapped later for one that isn't (see file docstring for what's already
+    been verified vs. still open)."""
+    data = fetch_card(card_id, label, optional=optional, parameters=parameters)
     if data is None:
         return None
     df = pd.DataFrame(data)
@@ -296,68 +340,68 @@ def build_roster():
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ATTENDANCE  → attendance_score (0-100)
+# Card #11636 is genuinely user+lecture-level (verified from its saved native
+# SQL) — one row per user per lecture, with an explicit attended flag and
+# watch-time in minutes, so no merge with a separate lecture-calendar card is
+# needed at all.
 # ═══════════════════════════════════════════════════════════════════════════
 def build_attendance(y, m):
-    lectures = fetch_card_df(ATTENDANCE_LECTURES_CARD, "lecture calendar (6031)")
-    attendance = fetch_card_df(ATTENDANCE_CARD, "attendance (8646)", require_user_id=True)
+    df = fetch_card_df(ATTENDANCE_CARD, "attendance (11636)", require_user_id=True)
 
-    merge_keys = [k for k in ["lecture_id", "lecture_date", "course_name"] if k in lectures.columns and k in attendance.columns]
-    if not merge_keys:
-        raise RuntimeError(f"❌ No common merge keys between card {ATTENDANCE_LECTURES_CARD} and {ATTENDANCE_CARD} — check column names.")
-    df = pd.merge(lectures, attendance, on=merge_keys, how="inner")
+    required = {"lecture_id", "lecture_start_timestamp", "overall_attended_flag", "time_spent_mins"}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        raise RuntimeError(
+            f"❌ Card {ATTENDANCE_CARD} is missing expected column(s) {missing_cols} — "
+            f"it may have changed since this was last verified. Columns were: {list(df.columns)}"
+        )
 
-    date_col = "lecture_date" if "lecture_date" in df.columns else merge_keys[0]
-    df = df[in_target_month(df[date_col], y, m)]
+    df["lecture_start_timestamp"] = pd.to_datetime(df["lecture_start_timestamp"], errors="coerce")
+    df = df[in_target_month(df["lecture_start_timestamp"], y, m)]
+    if df.empty:
+        print(f"⚠️  No attendance rows for {calendar.month_name[m]} {y} "
+              f"(remember: card {ATTENDANCE_CARD} excludes 'advantage'/'agentic' batches — see docstring).")
+        return pd.DataFrame(columns=["user_id", "no_of_attended", "sessions_in_scope", "avg_time", "attendance_score"])
 
-    attended_col = next((c for c in df.columns if "attend" in c.lower() and df[c].dropna().isin([0, 1, True, False]).all()), None)
-    time_col = next((c for c in df.columns if "time" in c.lower() and "spent" in c.lower()), None)
-
-    agg = {"lecture_id": "nunique"}
-    if attended_col:
-        agg[attended_col] = "sum"
-    if time_col:
-        agg[time_col] = "mean"
-    out = df.groupby("user_id").agg(agg).reset_index()
-    out = out.rename(columns={"lecture_id": "sessions_in_scope"})
-    if attended_col:
-        out = out.rename(columns={attended_col: "no_of_attended"})
-        out["attendance_score"] = (out["no_of_attended"] / out["sessions_in_scope"]).clip(0, 1) * 100
-    else:
-        # Fall back to "appeared in the merged table at all" if there's no explicit flag column —
-        # PRINT columns so you can confirm/correct the attended_col heuristic above.
-        print(f"⚠️  Could not auto-detect an 'attended' flag column in card {ATTENDANCE_CARD}. "
-              f"Columns were: {list(attendance.columns)}. Treating every merged row as attended.")
-        out["no_of_attended"] = out["sessions_in_scope"]
-        out["attendance_score"] = 100.0
-    if time_col:
-        out = out.rename(columns={time_col: "avg_time"})
-    return out[["user_id", "no_of_attended", "sessions_in_scope"] + (["avg_time"] if time_col else []) + ["attendance_score"]]
+    out = df.groupby("user_id").agg(
+        sessions_in_scope=("lecture_id", "nunique"),
+        no_of_attended=("overall_attended_flag", "sum"),
+        avg_time=("time_spent_mins", "mean"),
+    ).reset_index()
+    out["attendance_score"] = (out["no_of_attended"] / out["sessions_in_scope"]).clip(0, 1) * 100
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ASSIGNMENTS  → assignment_score (0-100)
+# Card #7939 is genuinely user-level (verified from its saved native SQL) and
+# already returns pre-computed 0-100 completion percentages — but as ONE
+# cumulative row per user per module, no row-level completion date. Its
+# `Date` template tag scopes which assignments count by RELEASE date, so
+# it's fetched here with that parameter set to the target month, separately
+# from the blind prefetch (which can't parameterize per-card).
 # ═══════════════════════════════════════════════════════════════════════════
 def build_assignments(y, m):
-    df = fetch_card_df(ASSIGNMENTS_CARD, "assignments (7939)", require_user_id=True)
+    df = fetch_card_df(
+        ASSIGNMENTS_CARD, "assignments (7939, month-scoped)", require_user_id=True,
+        parameters=[date_range_param("Date", y, m)],
+    )
 
-    date_col = next((c for c in df.columns if "date" in c.lower() or "completed_at" in c.lower()), None)
-    if date_col:
-        df = df[in_target_month(df[date_col], y, m)]
-
-    ontime_col = next((c for c in df.columns if "ontime" in c.lower().replace(" ", "").replace("_", "")), None)
-    overall_col = next((c for c in df.columns if "overall" in c.lower() and "complet" in c.lower()), None)
-    if not ontime_col or not overall_col:
+    ontime_col, overall_col = "users_completion_rate_on_time", "users_completion_rate"
+    missing_cols = {ontime_col, overall_col} - set(df.columns)
+    if missing_cols:
         raise RuntimeError(
-            f"❌ Couldn't find on-time/overall completion columns on card {ASSIGNMENTS_CARD}. "
-            f"Columns were: {list(df.columns)} — update ontime_col/overall_col detection above."
+            f"❌ Card {ASSIGNMENTS_CARD} is missing expected column(s) {missing_cols} — "
+            f"it may have changed since this was last verified. Columns were: {list(df.columns)}"
         )
 
-    out = df.groupby("user_id").agg({ontime_col: "mean", overall_col: "mean"}).reset_index()
-    out = out.rename(columns={ontime_col: "ontime_completion", overall_col: "overall_completion"})
-    for c in ("ontime_completion", "overall_completion"):
-        if out[c].max() > 1.5:  # looks like a 0-100 scale already, not 0-1
-            out[c] = out[c] / 100
-    out["assignment_score"] = (0.6 * out["ontime_completion"] + 0.4 * out["overall_completion"]) * 100
+    # Both columns are already 0-100 percentages, one row per user per module —
+    # average across modules for a single per-user figure.
+    out = df.groupby("user_id").agg(
+        ontime_completion=(ontime_col, "mean"),
+        overall_completion=(overall_col, "mean"),
+    ).reset_index()
+    out["assignment_score"] = 0.6 * out["ontime_completion"] + 0.4 * out["overall_completion"]
     return out
 
 
@@ -599,7 +643,7 @@ if __name__ == "__main__":
 
         df = roster
         for part, cols in [
-            (attendance, ["user_id", "no_of_attended", "attendance_score"]),
+            (attendance, ["user_id", "no_of_attended", "sessions_in_scope", "avg_time", "attendance_score"]),
             (assignments, ["user_id", "ontime_completion", "overall_completion", "assignment_score"]),
             (module_contests, ["user_id", "module_contest_score"]),
             (projects, ["user_id", "avg_score", "median_score", "attempts_to_clear", "project_score"]),
