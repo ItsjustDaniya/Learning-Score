@@ -13,7 +13,8 @@ on:
     # 01:00 UTC on the 1st of every month = 06:30 IST — runs just after the
     # previous month has fully ended. Adjust the minute/hour if you'd rather
     # it run at a different time; GitHub Actions cron is always UTC.
-    - cron: "0 1 1 * *"
+    - cron: '30 21 * * *'    # 8:00 AM IST (2:30 UTC)
+    - cron: '30 9 * * *'
   workflow_dispatch:
     inputs:
       run_month_mode:
