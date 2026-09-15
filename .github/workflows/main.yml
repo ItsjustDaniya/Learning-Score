@@ -1,0 +1,52 @@
+name: Learning Score Cron
+
+# Scores the previous calendar month and writes it into its own tab
+# (e.g. "Sep-2026") in the Learning Score Google Sheet:
+# https://docs.google.com/spreadsheets/d/1AJZnBpHeE85eDYWNsj-Kz91PSyG0uo8iP8PQwRsS3vU/
+#
+# Reuses the same two secrets (METABASE_API_KEY, SERVICE_ACCOUNT_JSON) your
+# other crons (Module_contest / Data Pipeline Automation) already have set
+# at the repo or org level — nothing new to add there.
+
+on:
+  schedule:
+    
+    - cron: '30 21 * * *'    # 8:00 AM IST (2:30 UTC)
+    - cron: '30 9 * * *'
+  workflow_dispatch:
+    inputs:
+      run_month_mode:
+        description: "Score 'previous' (default) month or 'current' month-to-date"
+        required: false
+        default: "previous"
+        type: choice
+        options:
+          - previous
+          - current
+
+jobs:
+  run-learning-score:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Learning Score cron
+        env:
+          METABASE_API_KEY: ${{ secrets.METABASE_API_KEY }}
+          SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+          # Optional — only needed once you have the Groomers/Master Data
+          # sheet ID for Placement Profile Tags. Leave unset to skip that
+          # section cleanly.
+          GROOMERS_SHEET_KEY: ${{ secrets.GROOMERS_SHEET_KEY }}
+          RUN_MONTH_MODE: ${{ github.event.inputs.run_month_mode || 'previous' }}
+        run: python learning_score_cron.py
