@@ -164,6 +164,13 @@ ASSIGNMENTS_CARD = 7939            # Confirmed via saved-query inspection: user-
                                     # template-tag on assignment release date — queried WITH that
                                     # parameter set to the target month (see build_assignments()),
                                     # NOT part of the blind concurrent prefetch below.
+ASSIGNMENTS_DATE_TAG_ID = "2ee32c9b-aa6d-455a-8998-fe61db513efc"
+                                    # The "Date" template tag's own id on card #7939, pulled straight
+                                    # from its saved query definition (Metabase requires this exact id
+                                    # in the parameter payload, confirmed by the 400 error otherwise —
+                                    # see date_range_param()). If this card's Date filter is ever
+                                    # deleted and re-added (not just edited), Metabase will assign it a
+                                    # new id and this constant will need updating to match.
 
 PROJECTS_RAW_CARDS = (6241, 6242)  # Confirmed: Data Pipeline "Projects Raw" — user-level, has
                                     # Submission Time / marks_obtained / project_deadline_date.
@@ -216,14 +223,23 @@ def month_date_range_value(y, m):
     return f"{y:04d}-{m:02d}-01~{y:04d}-{m:02d}-{last_day:02d}"
 
 
-def date_range_param(tag_name, y, m):
+def date_range_param(tag_name, y, m, tag_id):
     """A Metabase `parameters` entry that binds a date/range value to a
     native-query template tag named `tag_name` (e.g. the `{{Date}}` tag on
     card #7939). Pass this in fetch_card(..., parameters=[...]) for any card
     that needs to be scoped to the target month server-side rather than
     filtered client-side after the fact (necessary for cards — like 7939 —
-    that return pre-aggregated numbers with no row-level date to filter on)."""
+    that return pre-aggregated numbers with no row-level date to filter on).
+
+    `tag_id` MUST be that template tag's own "id" (a UUID) as it appears in
+    the card's saved query definition — Metabase's /api/card/{id}/query/json
+    endpoint rejects a parameter with no "id" ("missing required key,
+    received: nil", confirmed against a real 400 response), it's not enough
+    to just name the tag via `target`. This id is per-card and per-tag, not
+    something this script can derive on its own — see ASSIGNMENTS_DATE_TAG_ID
+    below for where card #7939's was pulled from and how to find another."""
     return {
+        "id": tag_id,
         "type": "date/range",
         "target": ["dimension", ["template-tag", tag_name]],
         "value": month_date_range_value(y, m),
@@ -402,7 +418,7 @@ def build_attendance(y, m):
 def build_assignments(y, m):
     df = fetch_card_df(
         ASSIGNMENTS_CARD, "assignments (7939, month-scoped)", require_user_id=True,
-        parameters=[date_range_param("Date", y, m)],
+        parameters=[date_range_param("Date", y, m, ASSIGNMENTS_DATE_TAG_ID)],
     )
 
     ontime_col, overall_col = "users_completion_rate_on_time", "users_completion_rate"
