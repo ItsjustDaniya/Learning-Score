@@ -50,12 +50,7 @@ FIXED SINCE THE FIRST RUN (2026-09-15 GitHub Actions failures):
     a sheet this size in short of that). Since placement is a lagging
     outcome, the correlation uses each student's AVERAGE learning_score
     across every monthly tab this cron has ever written (not just this
-    month's snapshot) — see collect_historical_learning_scores(). Writes 3
-    new evergreen tabs (overwritten each run, not one per month):
-    "Placement Correlation - Summary" (Pearson r of each avg sub-score vs.
-    is_placed, and vs. LPA for the placed subset), "... - By Score Bucket"
-    (placement rate % per 20-point learning_score band), and
-    "... - Detail" (the merged per-user table those are computed from).
+    month's snapshot) — see collect_historical_learning_scores().
     ⚠ I derived STUDENT_TAGS_TAB/PROG_PLACEMENT_TAB's exact columns from a
     live look at the sheet on 2026-09-15, not a schema I can re-verify
     programmatically — build_student_tags()/build_prog_placement_detail()
@@ -64,6 +59,23 @@ FIXED SINCE THE FIRST RUN (2026-09-15 GitHub Actions failures):
     layout ever changes. ⚠ This sheet MUST be shared (at least Viewer) with
     the service account email (see ENV CHECK) or every read here returns
     nothing — silently, since this step is non-fatal by design.
+  - Tried writing Placement Correlation to its own separate spreadsheet, but
+    you asked for something simpler right after: just keep it inside THIS
+    Learning Score sheet, one named tab, created if missing / overwritten if
+    present — no new spreadsheet, no secret to copy around. So that's gone —
+    write_sheet() already does exactly "create if missing, clear+rewrite if
+    present" for every tab in this file, so the Placement Correlation step
+    now just calls it a second time, same as the monthly tab, targeting a
+    fixed tab named "Placement Corr" (you confirmed this by pasting this
+    same sheet's URL at gid=1637824989 — PLACEMENT_CORR_TAB below). It writes
+    the merged per-user Detail table only — user_id, avg_* scores across
+    every month tracked, is_placed, placement_tag, lpa, placement_month —
+    with user_id as the leftmost column so it's a clean VLOOKUP/QUERY key
+    back into the monthly tabs in this same sheet. The Summary (Pearson r per
+    metric) and By-Score-Bucket (placement rate % per 20-point band) tables
+    are still computed each run and printed to the log for a quick read, just
+    not written to the sheet — build your own pivot table in Sheets off the
+    Detail tab instead, since that's what you said you'd rather do yourself.
 
 STILL OPEN — fix these before trusting the numbers:
 
@@ -169,6 +181,13 @@ PLACEMENTS_SHEET_KEY = os.getenv("PLACEMENTS_SHEET_KEY", DEFAULT_PLACEMENTS_SHEE
 STUDENT_TAGS_TAB = os.getenv("STUDENT_TAGS_TAB", "Student_Tags")
 PROG_PLACEMENT_TAB = os.getenv("PROG_PLACEMENT_TAB", "Prog<>Placement")
 
+# Placement Correlation output tab — lives in THIS SAME Learning Score sheet
+# (you confirmed via this sheet's own URL at gid=1637824989), just one fixed
+# tab name, upserted every run exactly like every other tab in this file
+# (write_sheet() already creates-if-missing / clears-and-rewrites-if-present
+# — no separate spreadsheet, no extra secret to manage).
+PLACEMENT_CORR_TAB = os.getenv("PLACEMENT_CORR_TAB", "Placement Corr")
+
 # "previous" (default) scores last calendar month — run this on/after the
 # 1st and it scores the month that just ended. "current" scores month-to-date.
 RUN_MONTH_MODE = os.getenv("RUN_MONTH_MODE", "previous")
@@ -199,6 +218,7 @@ print(f"   SA client_email    : {service_info.get('client_email')}  (share both 
 print(f"   Learning Score sheet: {LEARNING_SCORE_SHEET_KEY}")
 print(f"   Groomers sheet      : {GROOMERS_SHEET_KEY} (tab: {GROOMERS_SHEET_TAB or '[first tab]'})")
 print(f"   Placements sheet    : {PLACEMENTS_SHEET_KEY} (tabs: '{STUDENT_TAGS_TAB}' + '{PROG_PLACEMENT_TAB}')")
+print(f"   Correlation tab     : '{PLACEMENT_CORR_TAB}' (in the Learning Score sheet above)")
 
 # Transport-level retries for transient network blips, same as your existing scripts
 SESSION = requests.Session()
@@ -1093,20 +1113,34 @@ if __name__ == "__main__":
         write_sheet(LEARNING_SCORE_SHEET_KEY, tab_name, df)
         write_sheet(LEARNING_SCORE_SHEET_KEY, f"{tab_name} - Module Contests (per module)", per_module_contests)
 
-        # ─── Placement correlation — recurring, evergreen tabs (not per-month) ───
-        # Non-fatal by design: a problem here (sheet not shared, tab renamed,
-        # etc.) is printed as a warning, never fails the run — the core
-        # Learning Score tab above is already safely written by this point.
+        # ─── Placement correlation — one evergreen tab, IN this same sheet ───
+        # (not per-month — upserted every run, same create-if-missing /
+        # clear-and-rewrite-if-present write_sheet() every other tab uses).
+        # Non-fatal by design: a problem here (Placements sheet not shared,
+        # tab renamed, etc.) is printed as a warning, never fails the run —
+        # the core Learning Score tab above is already safely written by
+        # this point.
         try:
             history = collect_historical_learning_scores()
             outcomes = build_placement_outcomes()
             corr_summary, corr_buckets, corr_detail = compute_placement_correlation(history, outcomes)
+
+            # Summary / bucket breakdowns aren't written to the sheet — you
+            # said you'd rather build your own pivots off the raw Detail
+            # table, so these are just printed here for a quick sanity check.
             if corr_summary is not None and not corr_summary.empty:
-                write_sheet(LEARNING_SCORE_SHEET_KEY, "Placement Correlation - Summary", corr_summary)
+                print("\n📈 Placement correlation summary (not written to sheet):")
+                print(corr_summary.to_string(index=False))
             if corr_buckets is not None and not corr_buckets.empty:
-                write_sheet(LEARNING_SCORE_SHEET_KEY, "Placement Correlation - By Score Bucket", corr_buckets)
+                print("\n📊 Placement rate by score bucket (not written to sheet):")
+                print(corr_buckets.to_string(index=False))
+
             if corr_detail is not None and not corr_detail.empty:
-                write_sheet(LEARNING_SCORE_SHEET_KEY, "Placement Correlation - Detail", corr_detail)
+                # user_id kept as the leftmost column on purpose — this is
+                # the column you'll VLOOKUP/QUERY against the monthly tabs
+                # in this same sheet.
+                corr_detail = corr_detail[["user_id"] + [c for c in corr_detail.columns if c != "user_id"]]
+                write_sheet(LEARNING_SCORE_SHEET_KEY, PLACEMENT_CORR_TAB, corr_detail)
         except Exception:
             print("\n⚠️  Placement correlation step failed (Learning Score tabs above were still written OK):")
             traceback.print_exc()
