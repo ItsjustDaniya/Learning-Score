@@ -23,13 +23,6 @@ FIXED SINCE THE FIRST RUN (2026-09-15 GitHub Actions failures):
   - Card #11636's actual output has 'overall_attendance' (0/100, already
     scaled), not 'overall_attended_flag' as first assumed — confirmed from
     the second run's real column list. Fixed to use overall_attendance.
-  - Groomers/Master Data sheet ID now wired in
-    (13HWMhfMX3i5qsDCEYnQD1h1iFL-ScoNz0HQSgd4CIks) — but I still don't know
-    its tab name or column names, so build_placement_tags() falls back to
-    the first tab and auto-detects a user_id-like column; it prints every
-    column name it finds on each run so you can tell me the real join column
-    if "user_id" isn't it. ⚠ Share this sheet with the service account email
-    too (see ENV CHECK output) or it won't be readable.
   - Added student_name / email / phone to the output. No new card needed —
     the roster card (#6289) already selects
     concat(first_name,' ',last_name) as student_name, auth_user.email, and
@@ -46,6 +39,13 @@ FIXED SINCE THE FIRST RUN (2026-09-15 GitHub Actions failures):
     at all, in either direction. If you want this automated again later, the
     prior approach (join on user_id, correlate avg learning_score against
     is_placed) is straightforward to re-add — just say so.
+  - REMOVED build_placement_tags() entirely (it read the "Groomers and
+    Master Data 2026" sheet for reference-only "Placement Profile Tags"
+    columns) — per your request this script now ignores every placement-
+    related sheet, not just "Placements - FlyWheel". GROOMERS_SHEET_KEY /
+    GROOMERS_SHEET_TAB config, the ENV CHECK line for it, and the merge into
+    the output df are all gone too. Nothing in this script reads or writes
+    any Google Sheet except the Learning Score sheet itself.
 
 STILL OPEN — fix these before trusting the numbers:
 
@@ -62,10 +62,6 @@ STILL OPEN — fix these before trusting the numbers:
      `'%agentic%'`) — if your Learning Score cohort includes those tracks,
      their attendance will come back null. Flag if so and I'll find/build an
      unfiltered version.
-  4. Placement Profile Tags — sheet ID is wired (see above) but tab/column
-     names are still unverified; check the "📋 Groomers sheet tab..." log
-     line on the next run and tell me if the auto-detected join column is
-     wrong.
 
 FIXED SINCE THE 2026-09-21 FAILURE — the real traceback showed the actual
 cause was card #7577 (grooming sessions) hitting a transient Postgres error
@@ -143,23 +139,15 @@ SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON")
 DEFAULT_LEARNING_SCORE_SHEET_KEY = "1AJZnBpHeE85eDYWNsj-Kz91PSyG0uo8iP8PQwRsS3vU"
 LEARNING_SCORE_SHEET_KEY = os.getenv("LEARNING_SCORE_SHEET_KEY", DEFAULT_LEARNING_SCORE_SHEET_KEY)
 
-# "Groomers and Master Data 2026" sheet:
-# https://docs.google.com/spreadsheets/d/13HWMhfMX3i5qsDCEYnQD1h1iFL-ScoNz0HQSgd4CIks/
-# Defaulted here too, same as the Learning Score sheet — still overridable.
-# ⚠ Also needs to be shared (at least Viewer) with the service account email.
-# GROOMERS_SHEET_TAB is intentionally left unset by default: I don't know the
-# real tab name, so build_placement_tags() falls back to "whichever tab is
-# first" rather than guessing a name that might not exist. Set
-# GROOMERS_SHEET_TAB explicitly once you know which tab holds the data.
-DEFAULT_GROOMERS_SHEET_KEY = "13HWMhfMX3i5qsDCEYnQD1h1iFL-ScoNz0HQSgd4CIks"
-GROOMERS_SHEET_KEY = os.getenv("GROOMERS_SHEET_KEY", DEFAULT_GROOMERS_SHEET_KEY)
-GROOMERS_SHEET_TAB = os.getenv("GROOMERS_SHEET_TAB")  # None = use the first tab
-
-# NOTE: the Placement Correlation step (reading the "Placements - FlyWheel"
-# sheet and writing a "Placement Corr" tab) has been REMOVED per your
-# request — this cron no longer reads from or writes to the Placements sheet
-# at all. You're maintaining "Placement Corr" yourself now (a manual copy of
-# the Prog<>Placement data) and doing the correlation analysis separately.
+# NOTE: EVERY placement-related sheet touchpoint has been REMOVED per your
+# request — this cron no longer reads from or writes to any placements sheet
+# in any way. That includes the "Placements - FlyWheel" correlation step
+# (removed earlier) AND the "Groomers and Master Data 2026" sheet
+# (13HWMhfMX3i5qsDCEYnQD1h1iFL-ScoNz0HQSgd4CIks) that build_placement_tags()
+# used to read for reference-only "Placement Profile Tags" columns — that
+# function and its call/merge are gone too. You're maintaining "Placement
+# Corr" yourself as a manual copy of the Prog<>Placement data and doing the
+# correlation analysis separately.
 
 # "previous" (default) scores last calendar month — run this on/after the
 # 1st and it scores the month that just ended. "current" scores month-to-date.
@@ -187,9 +175,8 @@ METABASE_HEADERS = {"Content-Type": "application/json", "X-Api-Key": METABASE_AP
 
 print("🔎 ENV CHECK")
 print(f"   Metabase API key   : {'[SET]' if METABASE_API_KEY else '[MISSING]'}")
-print(f"   SA client_email    : {service_info.get('client_email')}  (share both Sheets with this)")
+print(f"   SA client_email    : {service_info.get('client_email')}  (share the Sheet with this)")
 print(f"   Learning Score sheet: {LEARNING_SCORE_SHEET_KEY}")
-print(f"   Groomers sheet      : {GROOMERS_SHEET_KEY} (tab: {GROOMERS_SHEET_TAB or '[first tab]'})")
 
 # Transport-level retries for transient network blips, same as your existing scripts
 SESSION = requests.Session()
@@ -714,35 +701,6 @@ def build_sessions(y, m):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PLACEMENT PROFILE TAGS — from the Groomers/Master Data sheet, once wired.
-# Reference columns only; NOT part of the numeric composite.
-# ═══════════════════════════════════════════════════════════════════════════
-def build_placement_tags():
-    if not GROOMERS_SHEET_KEY:
-        return None
-    try:
-        sheet = gc.open_by_key(GROOMERS_SHEET_KEY)
-        # No confirmed tab name yet — use the tab explicitly set via
-        # GROOMERS_SHEET_TAB if you've set one, otherwise whichever tab is
-        # first, rather than guessing a name that might not exist.
-        ws = sheet.worksheet(GROOMERS_SHEET_TAB) if GROOMERS_SHEET_TAB else sheet.get_worksheet(0)
-        records = ws.get_all_records()
-        df = pd.DataFrame(records)
-        print(f"📋 Groomers sheet tab '{ws.title}': {len(df)} rows, columns: {list(df.columns)}")
-        user_col = next((c for c in df.columns if c.lower().replace(" ", "_") in ("user_id", "userid")), None)
-        if user_col is None:
-            print(f"⚠️  No obvious user_id column in tab '{ws.title}' — columns were: {list(df.columns)}. "
-                  f"Tell me the real join column (user_id? email? student name?) and I'll wire it up.")
-            return None
-        if user_col != "user_id":
-            df = df.rename(columns={user_col: "user_id"})
-        return df
-    except Exception as e:
-        print(f"⚠️  Could not read Groomers sheet: {e}")
-        return None
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # COMPOSITE SCORE
 # ═══════════════════════════════════════════════════════════════════════════
 # Category weights, as agreed — tune freely, they're read fresh each run.
@@ -814,7 +772,6 @@ if __name__ == "__main__":
         projects = build_projects(y, m)
         arena = build_arena(y, m)
         sessions = build_sessions(y, m)
-        placement_tags = build_placement_tags()
 
         df = roster
         for part, cols in [
@@ -834,14 +791,11 @@ if __name__ == "__main__":
         df["learning_score"] = df.apply(compute_composite, axis=1)
         df["month"] = tab_name
 
-        if placement_tags is not None:
-            df = pd.merge(df, placement_tags, on="user_id", how="left", suffixes=("", "_placement"))
-
         write_sheet(LEARNING_SCORE_SHEET_KEY, tab_name, df)
         write_sheet(LEARNING_SCORE_SHEET_KEY, f"{tab_name} - Module Contests (per module)", per_module_contests)
 
-        # NOTE: the Placement Correlation step has been removed — this cron
-        # no longer reads from or writes to the Placements sheet in any way.
+        # NOTE: no placement-sheet interaction of any kind happens in this
+        # script — see the top-of-file note.
 
         elapsed = time.time() - start_time
         print(f"\n🎯 Done in {int(elapsed // 60)}m {int(elapsed % 60)}s — {len(df)} users scored for {tab_name}.")
