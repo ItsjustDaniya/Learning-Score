@@ -67,6 +67,40 @@ STILL OPEN — fix these before trusting the numbers:
      line on the next run and tell me if the auto-detected join column is
      wrong.
 
+FIXED SINCE THE 2026-09-21 FAILURE — the real traceback showed the actual
+cause was card #7577 (grooming sessions) hitting a transient Postgres error
+after 154s: "canceling statement due to conflict with recovery / User was
+holding shared buffer pin for too long" — a hot-standby read-replica
+cancelling a slow query mid-WAL-replay, NOT the huge 11636/9251 payloads I'd
+initially (and wrongly) suspected from the truncated log. metabase_request()
+now retries that specific error signature (and a couple of close cousins —
+statement timeout, deadlock detected) with the same backoff it already used
+for connection errors, instead of failing the whole run on the first hit —
+see _is_transient_query_error(). The two payload-size fixes below are still
+worth having (9251 was genuinely being pulled all-time for no reason) but
+weren't what broke this particular run:
+  - Card #9251 (TA sessions) actually HAS a `{{date}}` template tag on its
+    saved query (bound to video_sessions_onetoone.start_timestamp, tag id
+    e265d2ea-9732-4bf3-ab63-fa42ea82b7f8) that this script simply wasn't
+    using — it was in the blind unscoped prefetch, so every run pulled the
+    ENTIRE 1:1-session history. Moved it out of prefetch_all_cards() and into
+    build_sessions(), fetched with that date parameter set to the target
+    month, the same way build_assignments() already scopes card #7939. This
+    should shrink its payload from ~25MB all-time to a few hundred KB/month.
+  - Card #11636 (attendance) has NO date/range template tag on its saved
+    query at all (checked its saved SQL directly) — the `start_timestamp >
+    '01-01-2025'` bound is hardcoded in the query text, not parameterized, so
+    there's no equivalent server-side scoping fix available from this script.
+    It will keep growing every month as more lectures happen since Jan 2025.
+    If the 160MB payload turns out to be what's actually killing the run
+    (once you get me the real traceback — OOM on the runner, a timeout, etc.)
+    the next options are: (a) ask whoever owns that saved question in
+    Metabase to add a date template tag to it, mirroring #9251/#7939, or (b)
+    switch this script to fetch it via /query/csv instead of /query/json —
+    CSV is meaningfully more compact than JSON for a ~30-column table since
+    JSON repeats every column name on every row. Not done yet since I
+    haven't confirmed memory/timeout is actually what's failing.
+
 Everything else (roster, attendance, assignments, module contests, projects,
 grooming-session count) is now verified against actual Metabase query
 definitions or your two production scripts' real output — see CARD IDS below.
@@ -194,6 +228,15 @@ ASSIGNMENTS_DATE_TAG_ID = "2ee32c9b-aa6d-455a-8998-fe61db513efc"
                                     # deleted and re-added (not just edited), Metabase will assign it a
                                     # new id and this constant will need updating to match.
 
+TA_SESSIONS_DATE_TAG_ID = "e265d2ea-9732-4bf3-ab63-fa42ea82b7f8"
+                                    # Card #9251's own `{{date}}` template tag id (tag name "date",
+                                    # widget-type date/range, bound to
+                                    # video_sessions_onetoone.start_timestamp) — confirmed straight from
+                                    # its saved query. Previously unused, so every run pulled the card's
+                                    # entire all-time history (~25MB) instead of just the target month;
+                                    # now passed explicitly, same pattern as ASSIGNMENTS_DATE_TAG_ID
+                                    # above. See the file docstring's 2026-09-21 fix note.
+
 PROJECTS_RAW_CARDS = (6241, 6242)  # Confirmed: Data Pipeline "Projects Raw" — user-level, has
                                     # Submission Time / marks_obtained / project_deadline_date.
 PROJECT_EVAL_CARDS = (6578, 6579)  # Confirmed: Data Pipeline "Project Evaluations".
@@ -204,16 +247,20 @@ GROOMING_SESSIONS_CARD = 7577      # From the DS Learning Queries collection —
 
 TA_SESSIONS_CARD = 9251            # ⚠ BEST GUESS — not used by either existing pipeline. Confirm this
                                     # is really "1:1 sessions a student attended" and not something else.
+                                    # Has a confirmed `{{date}}` template tag (see TA_SESSIONS_DATE_TAG_ID)
+                                    # — fetched separately, month-scoped, inside build_sessions(), same
+                                    # as ASSIGNMENTS_CARD below. NOT part of the blind prefetch.
 
 ARENA_CARD = None                  # ⚠ NOT IDENTIFIED — see build_arena() below.
 
-# ASSIGNMENTS_CARD is deliberately excluded — it's fetched separately, with a
-# month-scoped Date parameter, inside build_assignments().
+# ASSIGNMENTS_CARD and TA_SESSIONS_CARD are deliberately excluded — they're
+# fetched separately, each with its own month-scoped date parameter, inside
+# build_assignments() / build_sessions() respectively.
 REQUIRED_CARDS = [
     ROSTER_CARD, CONTEST_MCQ_CARD, CONTEST_CODING_CARD,
     ATTENDANCE_CARD,
     *PROJECTS_RAW_CARDS, *PROJECT_EVAL_CARDS,
-    GROOMING_SESSIONS_CARD, TA_SESSIONS_CARD,
+    GROOMING_SESSIONS_CARD,
 ]
 
 # Module labels as they appear in the Learning Score sheet -> module_name
@@ -268,6 +315,30 @@ def date_range_param(tag_name, y, m, tag_id):
     }
 
 
+def _is_transient_query_error(res):
+    """Some queries come back as HTTP 400 where the body shows the DATABASE
+    itself cancelled the query rather than Metabase rejecting a bad request —
+    confirmed from a real 2026-09-21 failure on card #7577:
+        "ERROR: canceling statement due to conflict with recovery
+         Detail: User was holding shared buffer pin for too long."
+    That's Postgres on a hot-standby/read replica cancelling a slow query
+    because it held a buffer pin too long while WAL replication was catching
+    up — a timing coincidence with replica load, not a bad query or a bad
+    parameter. It (and its cousins below) normally succeeds a moment later,
+    so these are worth retrying with backoff exactly like a connection error.
+    Anything else that comes back as HTTP 400 (e.g. a malformed parameter)
+    still fails fast — no signature match, no retry."""
+    if res.status_code != 400:
+        return False
+    text = res.text.lower()
+    return any(sig in text for sig in (
+        "conflict with recovery",
+        "shared buffer pin",
+        "statement timeout",
+        "deadlock detected",
+    ))
+
+
 def metabase_request(card_id, label=None, timeout=480, max_conn_retries=5,
                       conn_backoff=30, max_conn_backoff=240, parameters=None):
     label = label or f"card {card_id}"
@@ -295,6 +366,13 @@ def metabase_request(card_id, label=None, timeout=480, max_conn_retries=5,
             raise RuntimeError(f"❌ Request failed fetching {label} ({url}): {e}")
         elapsed = time.time() - t0
         if res.status_code != 200:
+            if _is_transient_query_error(res) and attempt < max_conn_retries:
+                print(f"⚠️  {label} hit a transient DB-side query cancellation after {elapsed:.1f}s "
+                      f"(replica WAL-replay conflict, not a bad query) — retrying in {backoff}s...\n"
+                      f"{res.text[:300]}")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, max_conn_backoff)
+                continue
             raise RuntimeError(f"❌ {label} returned HTTP {res.status_code} after {elapsed:.1f}s.\n{res.text[:500]}")
         print(f"✓ {label} done in {elapsed:.1f}s — {len(res.text)} bytes")
         return res
@@ -594,9 +672,18 @@ def build_arena(y, m):
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TA + GROOMING SESSIONS  → session_score (0-100)
+# TA sessions (9251) is fetched here with its own `{{date}}` template-tag
+# parameter set to the target month — confirmed to exist on its saved query
+# (see TA_SESSIONS_DATE_TAG_ID) — instead of via the blind all-time prefetch,
+# same pattern as build_assignments(). Grooming sessions (7577) has no such
+# tag as far as I've checked, so it's still fetched all-time and filtered
+# client-side below.
 # ═══════════════════════════════════════════════════════════════════════════
 def build_sessions(y, m):
-    ta = fetch_card_df(TA_SESSIONS_CARD, "TA sessions (9251)", optional=True)
+    ta = fetch_card_df(
+        TA_SESSIONS_CARD, "TA sessions (9251, month-scoped)", optional=True,
+        parameters=[date_range_param("date", y, m, TA_SESSIONS_DATE_TAG_ID)],
+    )
     grooming = fetch_card_df(GROOMING_SESSIONS_CARD, "grooming sessions (7577)", optional=True)
 
     counts = []
