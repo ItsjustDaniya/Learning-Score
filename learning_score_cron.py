@@ -97,6 +97,32 @@ weren't what broke this particular run:
     JSON repeats every column name on every row. Not done yet since I
     haven't confirmed memory/timeout is actually what's failing.
 
+ADDED 2026-09-22 — BACKFILL MODE, to build up enough historical months to
+correlate learning_score against placement outcomes:
+  - Set RUN_MONTH_MODE=backfill (plus BACKFILL_START_MONTH, e.g. "2025-12",
+    and optionally BACKFILL_END_MONTH — defaults to the last fully completed
+    month) and this script now scores and writes EVERY month in that range in
+    one run, not just one. target_month() became target_months(), returning
+    a list — one entry for "previous"/"current" mode (unchanged behavior),
+    one entry per month for "backfill".
+  - The expensive all-time card fetches (roster, attendance #11636, module
+    contests, projects, grooming sessions) still happen exactly ONCE via
+    prefetch_all_cards() and build_roster() before the month loop — each is
+    all-time data already filtered per-month client-side (in_target_month()),
+    so backfilling 8 more months costs nothing extra there. Only the two
+    cards fetched with a server-side date parameter (assignments #7939, TA
+    sessions #9251) are re-fetched once per backfilled month — that's
+    necessary, not wasteful, since that's the whole point of scoping them.
+  - One month failing (e.g. another transient DB hiccup like the 7577 one
+    above) no longer kills the rest of the backfill — each month's
+    build+write is now wrapped individually, failures are collected and
+    reported at the end, and the run only exits non-zero if at least one
+    month failed. Re-running the same range afterward is safe/idempotent —
+    write_sheet() clears and rewrites each tab from scratch either way.
+  - Run it locally or via workflow_dispatch (see the .yml — now has
+    run_month_mode: backfill as an option plus backfill_start_month /
+    backfill_end_month inputs, and a longer timeout to match).
+
 Everything else (roster, attendance, assignments, module contests, projects,
 grooming-session count) is now verified against actual Metabase query
 definitions or your two production scripts' real output — see CARD IDS below.
@@ -151,7 +177,17 @@ LEARNING_SCORE_SHEET_KEY = os.getenv("LEARNING_SCORE_SHEET_KEY", DEFAULT_LEARNIN
 
 # "previous" (default) scores last calendar month — run this on/after the
 # 1st and it scores the month that just ended. "current" scores month-to-date.
+# "backfill" scores EVERY month from BACKFILL_START_MONTH through
+# BACKFILL_END_MONTH (inclusive) in one run — see target_months() and the
+# file docstring's 2026-09-22 note.
 RUN_MONTH_MODE = os.getenv("RUN_MONTH_MODE", "previous")
+
+# Backfill mode only. Both accept "YYYY-MM" (e.g. "2025-12") or "Mon-YYYY"
+# (e.g. "Dec-2025"). BACKFILL_START_MONTH is required when RUN_MONTH_MODE=
+# backfill; BACKFILL_END_MONTH is optional and defaults to the last fully
+# completed calendar month (same month "previous" mode would score).
+BACKFILL_START_MONTH = os.getenv("BACKFILL_START_MONTH")
+BACKFILL_END_MONTH = os.getenv("BACKFILL_END_MONTH")
 
 missing = [n for n, v in [
     ("METABASE_API_KEY", METABASE_API_KEY),
@@ -427,17 +463,74 @@ def prefetch_all_cards():
 # ═══════════════════════════════════════════════════════════════════════════
 # MONTH WINDOW
 # ═══════════════════════════════════════════════════════════════════════════
-def target_month():
-    """Returns (year, month, tab_name) for whichever month this run scores."""
+def _parse_year_month(s, label):
+    """Parses 'YYYY-MM' (e.g. '2025-12') or 'Mon-YYYY' (e.g. 'Dec-2025') into
+    (year, month). Used only by backfill mode's BACKFILL_START_MONTH /
+    BACKFILL_END_MONTH env vars."""
+    s = s.strip()
+    if "-" in s:
+        left, right = s.split("-", 1)
+        if left.isdigit() and len(left) == 4:
+            return int(left), int(right)
+        month_abbrs = {abbr.lower(): i for i, abbr in enumerate(calendar.month_abbr) if abbr}
+        m = month_abbrs.get(left.strip().lower()[:3])
+        if m and right.strip().isdigit():
+            return int(right), m
+    raise ValueError(
+        f"❌ Couldn't parse {label}={s!r} — expected 'YYYY-MM' (e.g. '2025-12') "
+        f"or 'Mon-YYYY' (e.g. 'Dec-2025')."
+    )
+
+
+def _add_months(y, m, n):
+    total = (y * 12 + (m - 1)) + n
+    return total // 12, total % 12 + 1
+
+
+def _last_completed_month(now):
+    first_of_this_month = now.replace(day=1)
+    last_month_end = first_of_this_month - timedelta(days=1)
+    return last_month_end.year, last_month_end.month
+
+
+def target_months():
+    """Returns a list of (year, month, tab_name) tuples for this run.
+
+    "previous" / "current" (default) — a single-element list, exactly as
+    target_month() used to return before backfill mode existed.
+
+    "backfill" — one element per calendar month from BACKFILL_START_MONTH
+    through BACKFILL_END_MONTH (inclusive, chronological order).
+    BACKFILL_END_MONTH defaults to the last fully completed month (same
+    month "previous" mode would score) if not set."""
     now = datetime.now(IST)
+
+    if RUN_MONTH_MODE == "backfill":
+        if not BACKFILL_START_MONTH:
+            raise ValueError("❌ RUN_MONTH_MODE=backfill requires BACKFILL_START_MONTH to be set (e.g. '2025-12').")
+        start_y, start_m = _parse_year_month(BACKFILL_START_MONTH, "BACKFILL_START_MONTH")
+        if BACKFILL_END_MONTH:
+            end_y, end_m = _parse_year_month(BACKFILL_END_MONTH, "BACKFILL_END_MONTH")
+        else:
+            end_y, end_m = _last_completed_month(now)
+
+        months = []
+        y, m = start_y, start_m
+        while (y, m) <= (end_y, end_m):
+            months.append((y, m, f"{calendar.month_abbr[m]}-{y}"))
+            y, m = _add_months(y, m, 1)
+        if not months:
+            raise ValueError(
+                f"❌ Backfill range is empty — BACKFILL_START_MONTH={BACKFILL_START_MONTH!r} "
+                f"is after the end month ({end_y:04d}-{end_m:02d})."
+            )
+        return months
+
     if RUN_MONTH_MODE == "current":
         y, m = now.year, now.month
     else:  # "previous"
-        first_of_this_month = now.replace(day=1)
-        last_month_end = first_of_this_month - timedelta(days=1)
-        y, m = last_month_end.year, last_month_end.month
-    tab_name = f"{calendar.month_abbr[m]}-{y}"
-    return y, m, tab_name
+        y, m = _last_completed_month(now)
+    return [(y, m, f"{calendar.month_abbr[m]}-{y}")]
 
 
 def in_target_month(series, y, m):
@@ -753,54 +846,94 @@ def write_sheet(sheet_key, worksheet_name, df):
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
+def score_month(y, m, tab_name, roster):
+    """Builds and writes the two sheet tabs for ONE month, reusing the
+    already-fetched/cached all-time cards (roster, attendance #11636, module
+    contest cards, project cards, grooming sessions #7577) and re-fetching
+    only the two cards that are scoped server-side per month (assignments
+    #7939, TA sessions #9251). Returns the number of users scored."""
+    attendance = build_attendance(y, m)
+    assignments = build_assignments(y, m)
+    per_module_contests, module_contests = build_module_contests(y, m)
+    projects = build_projects(y, m)
+    arena = build_arena(y, m)
+    sessions = build_sessions(y, m)
+
+    df = roster
+    for part, cols in [
+        (attendance, ["user_id", "no_of_attended", "sessions_in_scope", "avg_time", "attendance_score"]),
+        (assignments, ["user_id", "ontime_completion", "overall_completion", "assignment_score"]),
+        (module_contests, ["user_id", "module_contest_score"]),
+        (projects, ["user_id", "avg_score", "median_score", "attempts_to_clear", "project_score"]),
+        (arena, None),
+        (sessions, ["user_id", "sessions_attended", "session_score"]),
+    ]:
+        if part is None:
+            continue
+        use_cols = [c for c in (cols or part.columns) if c in part.columns]
+        df = pd.merge(df, part[use_cols], on="user_id", how="left")
+
+    df["arena_score"] = df.get("arena_score", np.nan)  # stays null until build_arena() is wired
+    df["learning_score"] = df.apply(compute_composite, axis=1)
+    df["month"] = tab_name
+
+    write_sheet(LEARNING_SCORE_SHEET_KEY, tab_name, df)
+    write_sheet(LEARNING_SCORE_SHEET_KEY, f"{tab_name} - Module Contests (per module)", per_module_contests)
+    return len(df)
+
+
 if __name__ == "__main__":
     print("🚀 Starting Learning Score cron...")
     print(f"📅 Start: {datetime.now(IST).strftime('%d-%b-%Y %H:%M:%S IST')}\n")
 
-    y, m, tab_name = target_month()
-    print(f"📆 Scoring month: {calendar.month_name[m]} {y}  →  tab '{tab_name}'\n")
+    try:
+        months = target_months()
+    except ValueError as e:
+        print(f"\n{e}")
+        sys.exit(1)
 
+    if len(months) > 1:
+        print(f"📦 BACKFILL MODE — scoring {len(months)} months: "
+              f"{months[0][2]} through {months[-1][2]}\n")
+    else:
+        y, m, tab_name = months[0]
+        print(f"📆 Scoring month: {calendar.month_name[m]} {y}  →  tab '{tab_name}'\n")
+
+    # Shared setup — fetched/built ONCE regardless of how many months are
+    # being scored (see score_month()'s docstring for why this is safe).
     try:
         prefetch_all_cards()
-
         roster = build_roster()
         print(f"👥 Active roster: {len(roster)} users")
-
-        attendance = build_attendance(y, m)
-        assignments = build_assignments(y, m)
-        per_module_contests, module_contests = build_module_contests(y, m)
-        projects = build_projects(y, m)
-        arena = build_arena(y, m)
-        sessions = build_sessions(y, m)
-
-        df = roster
-        for part, cols in [
-            (attendance, ["user_id", "no_of_attended", "sessions_in_scope", "avg_time", "attendance_score"]),
-            (assignments, ["user_id", "ontime_completion", "overall_completion", "assignment_score"]),
-            (module_contests, ["user_id", "module_contest_score"]),
-            (projects, ["user_id", "avg_score", "median_score", "attempts_to_clear", "project_score"]),
-            (arena, None),
-            (sessions, ["user_id", "sessions_attended", "session_score"]),
-        ]:
-            if part is None:
-                continue
-            use_cols = [c for c in (cols or part.columns) if c in part.columns]
-            df = pd.merge(df, part[use_cols], on="user_id", how="left")
-
-        df["arena_score"] = df.get("arena_score", np.nan)  # stays null until build_arena() is wired
-        df["learning_score"] = df.apply(compute_composite, axis=1)
-        df["month"] = tab_name
-
-        write_sheet(LEARNING_SCORE_SHEET_KEY, tab_name, df)
-        write_sheet(LEARNING_SCORE_SHEET_KEY, f"{tab_name} - Module Contests (per module)", per_module_contests)
-
-        # NOTE: no placement-sheet interaction of any kind happens in this
-        # script — see the top-of-file note.
-
-        elapsed = time.time() - start_time
-        print(f"\n🎯 Done in {int(elapsed // 60)}m {int(elapsed % 60)}s — {len(df)} users scored for {tab_name}.")
-
     except Exception:
-        print("\n❌ Learning Score cron failed:")
+        print("\n❌ Learning Score cron failed during shared setup:")
         traceback.print_exc()
+        sys.exit(1)
+
+    failures = []
+    for y, m, tab_name in months:
+        if len(months) > 1:
+            print("\n" + "=" * 60)
+            print(f"📆 Scoring {calendar.month_name[m]} {y}  →  tab '{tab_name}'")
+            print("=" * 60)
+        try:
+            n_users = score_month(y, m, tab_name, roster)
+            print(f"✅ {tab_name} done — {n_users} users scored.")
+        except Exception:
+            print(f"\n❌ {tab_name} failed:")
+            traceback.print_exc()
+            failures.append(tab_name)
+            continue  # one bad month shouldn't sink the rest of a backfill
+        if len(months) > 1:
+            time.sleep(3)  # be gentle on the Sheets API across many writes
+
+    # NOTE: no placement-sheet interaction of any kind happens in this
+    # script — see the top-of-file note.
+
+    elapsed = time.time() - start_time
+    scored = len(months) - len(failures)
+    print(f"\n🎯 Done in {int(elapsed // 60)}m {int(elapsed % 60)}s — "
+          f"{scored}/{len(months)} month(s) scored successfully.")
+    if failures:
+        print(f"❌ Failed month(s): {', '.join(failures)}")
         sys.exit(1)
