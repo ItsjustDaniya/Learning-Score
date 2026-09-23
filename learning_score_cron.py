@@ -126,8 +126,41 @@ correlate learning_score against placement outcomes:
 Everything else (roster, attendance, assignments, module contests, projects,
 grooming-session count) is now verified against actual Metabase query
 definitions or your two production scripts' real output — see CARD IDS below.
+
+ADDED 2026-09-23 — STUDENT MASTER VIEW + LOOKUP, so you get one combined
+view instead of having to rebuild "Placements x Batch" by hand each time:
+  - After every run (whatever RUN_MONTH_MODE), this script now also
+    rebuilds two extra tabs in the same Learning Score sheet:
+      • "Student Master View" — one row per student: every scored month's
+        learning_score (columns discovered automatically from whichever
+        month tabs currently exist in the sheet — nothing hardcoded, so it
+        stays current as you backfill/score more months), avg score, trend,
+        the LATEST month's sub-scores (attendance/assignment/module
+        contest/project/session/arena), and — best-effort — placement
+        outcome + persona.
+      • "Student Lookup" — two input cells (batch name / user ID) plus a
+        live FILTER() pulling the matching row(s) out of Student Master
+        View. Fill in either box (or both, or neither for everyone) and
+        the matches appear underneath. This is the ".. just fill the batch
+        name and user id .." view you asked for.
+  - IMPORTANT re: the placements-sheet boundary from earlier — this reads
+    the "Placement Corr" tab, which lives INSIDE this same Learning Score
+    sheet (the one you already maintain yourself via IMPORTRANGE). The
+    external "Placements - FlyWheel" sheet is still never touched, in
+    either direction — that boundary from your "ignore the placements
+    sheet" instruction hasn't changed. If "Placement Corr" is missing,
+    renamed, or its columns don't match what's expected (UserID / f /
+    Placed / Placement Month / Placeability / Persona / Persona UPDATED /
+    Persona (Sai sheet) — confirmed against your actual tab), this step
+    just logs a warning and leaves those columns blank; it never fails the
+    run, since the per-month scoring is the part that actually matters.
+  - Built in Python/pandas, not spreadsheet formulas — faster to open,
+    nothing to break across Excel/Sheets/LibreOffice, and it fully
+    rebuilds (clear + rewrite) every run, so it's always in sync with
+    whatever month tabs currently exist.
 """
 import os
+import re
 import sys
 import json
 import time
@@ -165,15 +198,15 @@ SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON")
 DEFAULT_LEARNING_SCORE_SHEET_KEY = "1AJZnBpHeE85eDYWNsj-Kz91PSyG0uo8iP8PQwRsS3vU"
 LEARNING_SCORE_SHEET_KEY = os.getenv("LEARNING_SCORE_SHEET_KEY", DEFAULT_LEARNING_SCORE_SHEET_KEY)
 
-# NOTE: EVERY placement-related sheet touchpoint has been REMOVED per your
-# request — this cron no longer reads from or writes to any placements sheet
-# in any way. That includes the "Placements - FlyWheel" correlation step
-# (removed earlier) AND the "Groomers and Master Data 2026" sheet
-# (13HWMhfMX3i5qsDCEYnQD1h1iFL-ScoNz0HQSgd4CIks) that build_placement_tags()
-# used to read for reference-only "Placement Profile Tags" columns — that
-# function and its call/merge are gone too. You're maintaining "Placement
-# Corr" yourself as a manual copy of the Prog<>Placement data and doing the
-# correlation analysis separately.
+# NOTE: this script still never reads or writes any EXTERNAL placements
+# sheet — the "Placements - FlyWheel" correlation step (removed earlier) and
+# the "Groomers and Master Data 2026" sheet's build_placement_tags() (also
+# removed) both stay gone, per your instruction. As of 2026-09-23 it DOES
+# read one tab — "Placement Corr" — but that tab lives INSIDE this same
+# Learning Score sheet (you maintain it yourself via IMPORTRANGE from the
+# external sheet), used only to build the "Student Master View" / "Student
+# Lookup" tabs below. See the file docstring's 2026-09-23 note for the full
+# explanation and why this doesn't reopen the door you asked closed.
 
 # "previous" (default) scores last calendar month — run this on/after the
 # 1st and it scores the month that just ended. "current" scores month-to-date.
@@ -844,6 +877,268 @@ def write_sheet(sheet_key, worksheet_name, df):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# STUDENT MASTER VIEW + LOOKUP — see the file docstring's 2026-09-23 note.
+# Runs once at the very end of a run (not per-month) since it aggregates
+# across every month tab that currently exists in the sheet, not just the
+# one(s) scored this run.
+# ═══════════════════════════════════════════════════════════════════════════
+MASTER_VIEW_TAB = "Student Master View"
+LOOKUP_TAB = "Student Lookup"
+PLACEMENT_CORR_TAB = "Placement Corr"
+
+MONTH_TAB_RE = re.compile(r"^[A-Z][a-z]{2}-\d{4}$")  # e.g. "Aug-2026" — excludes
+                                                       # its "... - Module Contests
+                                                       # (per module)" companion tab
+
+# Column-name candidates on the "Placement Corr" tab, in priority order —
+# confirmed against your actual tab (2026-09-23). Kept as candidate LISTS
+# (not single hardcoded names) so a header rename on your end degrades
+# gracefully instead of silently breaking. "f" is not a typo — that really
+# is the live header on the batch column.
+PLACEMENT_CORR_COLS = {
+    "user_id":         ["UserID", "User ID", "user_id"],
+    "batch":           ["Placement-Pipeline Batch", "Placement Batch", "f", "Batch"],
+    "placed":          ["Placed"],
+    "placement_month": ["Placement Month"],
+    "placeability":    ["Placeability"],
+    "persona_updated": ["Persona UPDATED"],
+    "persona_raw":     ["Persona"],
+    "persona_sai":     ["Persona (Sai sheet)"],
+}
+
+_PERSONA_JUNK = {"", "na", "n/a", "#n/a", "data not found", "value could not found", "none"}
+_PERSONA_BUCKETS = ("Moonshot", "Excellent", "Good", "Average", "Weak")
+
+MASTER_VIEW_SUB_SCORE_COLS = [
+    "attendance_score", "assignment_score", "module_contest_score",
+    "project_score", "session_score", "arena_score",
+]
+
+
+def _uid_str(v):
+    """Stringify a user_id without float artifacts ('54414.0' -> '54414')."""
+    if pd.isna(v):
+        return ""
+    try:
+        return str(int(float(v)))
+    except (TypeError, ValueError):
+        return str(v).strip()
+
+
+def col_letter(n):
+    """1-indexed column number -> spreadsheet column letter(s) (1->A, 27->AA)."""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _find_col(header, candidates):
+    """Index (0-based) of the first column in `header` matching any of
+    `candidates` (case/whitespace-insensitive, in priority order), else None."""
+    normalized = {(h or "").strip().lower(): i for i, h in enumerate(header)}
+    for cand in candidates:
+        i = normalized.get(cand.strip().lower())
+        if i is not None:
+            return i
+    return None
+
+
+def _clean_persona(v):
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s.lower() in _PERSONA_JUNK:
+        return None
+    return s
+
+
+def _persona_bucket(v):
+    if not v:
+        return None
+    low = v.lower()
+    for b in _PERSONA_BUCKETS:
+        if b.lower() in low:
+            return b
+    return None
+
+
+def discover_month_tabs(sheet):
+    """Every worksheet in THIS Learning Score sheet that looks like a scored
+    month tab ('Aug-2026') — sorted chronologically, oldest first. This is
+    what lets the master view stay current on its own as more months get
+    scored, with no month list to hand-maintain here."""
+    tabs = [ws.title for ws in sheet.worksheets() if MONTH_TAB_RE.match(ws.title)]
+    return sorted(tabs, key=lambda t: _parse_year_month(t, "month tab name"))
+
+
+def _read_tab_values(sheet, tab_name):
+    values = sheet.worksheet(tab_name).get_all_values()
+    if not values:
+        return [], []
+    return values[0], values[1:]
+
+
+def build_student_master_view(sheet, roster):
+    """Builds ONE wide table — a row per student, every scored month's
+    learning_score, the latest month's sub-scores, and (best-effort)
+    placement outcome + persona from the "Placement Corr" tab in THIS sheet.
+    Computed in Python/pandas, not spreadsheet formulas. Returns
+    (DataFrame, ordered_column_list), or (None, None) if there are no
+    scored month tabs yet."""
+    print("\n" + "=" * 60)
+    print("BUILDING STUDENT MASTER VIEW")
+    print("=" * 60)
+
+    month_tabs = discover_month_tabs(sheet)
+    if not month_tabs:
+        print("⚠️  No scored month tabs found in the sheet yet — skipping master view.")
+        return None, None
+    print(f"📅 Found {len(month_tabs)} scored month tab(s): {', '.join(month_tabs)}")
+
+    keep = [c for c in ["user_id", "student_name", "email", "au_batch_name", "label", "gem_label"] if c in roster.columns]
+    df = roster[keep].copy()
+    df = df.rename(columns={"au_batch_name": "batch"})
+    df["user_id"] = df["user_id"].apply(_uid_str)
+
+    month_cols = []
+    latest_tab, latest_by_uid = None, None
+    for tab in month_tabs:
+        print(f"  → reading '{tab}'...")
+        header, rows = _read_tab_values(sheet, tab)
+        if not header or "user_id" not in header:
+            print(f"  ⚠️  '{tab}' unreadable or missing user_id — skipped.")
+            continue
+        mdf = pd.DataFrame(rows, columns=header)
+        mdf["user_id"] = mdf["user_id"].apply(_uid_str)
+        mdf["learning_score"] = pd.to_numeric(mdf.get("learning_score"), errors="coerce")
+        col_name = f"{tab} LS"
+        df[col_name] = df["user_id"].map(mdf.set_index("user_id")["learning_score"])
+        month_cols.append(col_name)
+        latest_tab, latest_by_uid = tab, mdf.set_index("user_id")  # ends on the chronologically-last tab
+
+    if month_cols:
+        df["avg_learning_score"] = df[month_cols].mean(axis=1, skipna=True).round(1)
+        df["months_with_data"] = df[month_cols].notna().sum(axis=1)
+        df["score_trend"] = (df[month_cols[-1]] - df[month_cols[0]]).round(1)
+    else:
+        df["avg_learning_score"], df["months_with_data"], df["score_trend"] = np.nan, 0, np.nan
+
+    if latest_by_uid is not None:
+        for c in MASTER_VIEW_SUB_SCORE_COLS:
+            out_col = f"latest ({latest_tab}) {c}"
+            df[out_col] = df["user_id"].map(pd.to_numeric(latest_by_uid[c], errors="coerce")) if c in latest_by_uid.columns else np.nan
+
+    # ── Placement Corr — a tab in THIS sheet, see file docstring's 2026-09-23 note ──
+    placement_cols = ["placement_status", "placement_month", "placeability",
+                       "placement_pipeline_batch", "persona", "persona_bucket"]
+    for c in placement_cols:
+        df[c] = None
+    try:
+        pc_values = sheet.worksheet(PLACEMENT_CORR_TAB).get_all_values()
+        if not pc_values:
+            raise ValueError("tab is empty")
+        header, rows = pc_values[0], pc_values[1:]
+        idx = {key: _find_col(header, cands) for key, cands in PLACEMENT_CORR_COLS.items()}
+        if idx["user_id"] is None:
+            raise ValueError(f"couldn't find a UserID column — header started with {header[:10]}")
+        uid_i = idx["user_id"]
+        pc = {}
+        for r in rows:
+            if uid_i >= len(r) or not r[uid_i].strip():
+                continue
+            uid = _uid_str(r[uid_i])
+
+            def get(key, r=r):
+                i = idx.get(key)
+                return r[i].strip() if i is not None and i < len(r) and r[i] else None
+
+            persona = _clean_persona(get("persona_updated")) or _clean_persona(get("persona_raw")) or _clean_persona(get("persona_sai"))
+            pc[uid] = {
+                "placement_status": get("placed"),
+                "placement_month": get("placement_month"),
+                "placeability": get("placeability"),
+                "placement_pipeline_batch": get("batch"),
+                "persona": persona,
+                "persona_bucket": _persona_bucket(persona),
+            }
+        for c in placement_cols:
+            df[c] = df["user_id"].map(lambda u, c=c: pc.get(u, {}).get(c))
+        matched = df["user_id"].isin(pc.keys()).sum()
+        print(f"✓ Matched {matched}/{len(df)} students against '{PLACEMENT_CORR_TAB}' ({len(pc)} rows had a UserID there).")
+    except (gspread.exceptions.WorksheetNotFound, ValueError) as e:
+        print(f"⚠️  Couldn't read '{PLACEMENT_CORR_TAB}' tab ({e}) — placement/persona columns "
+              f"will be blank in the master view this run. Best-effort only — not fatal.")
+
+    ordered_cols = ["user_id", "student_name", "email", "batch", "label", "gem_label"]
+    ordered_cols += month_cols
+    ordered_cols += ["avg_learning_score", "months_with_data", "score_trend"]
+    if latest_by_uid is not None:
+        ordered_cols += [f"latest ({latest_tab}) {c}" for c in MASTER_VIEW_SUB_SCORE_COLS]
+    ordered_cols += placement_cols
+    ordered_cols = [c for c in ordered_cols if c in df.columns]
+    return df[ordered_cols], ordered_cols
+
+
+def write_lookup_tab(sheet, master_view_df, ordered_cols):
+    """Writes the compact 'Student Lookup' tab: two input cells (B3 = batch
+    name contains, B4 = user ID equals) and a live FILTER() pulling matching
+    rows out of Student Master View underneath. Uses Sheets' native FILTER/
+    SEARCH — written directly via gspread into Google Sheets, so (unlike the
+    one-off analysis workbook delivered earlier) there's no Excel/LibreOffice
+    portability concern here."""
+    if master_view_df is None:
+        return
+    n_rows, n_cols = len(master_view_df), len(ordered_cols)
+    last_col = col_letter(n_cols)
+    last_row = n_rows + 1  # +1 for Student Master View's own header row
+    batch_col = col_letter(ordered_cols.index("batch") + 1) if "batch" in ordered_cols else None
+    uid_col = col_letter(ordered_cols.index("user_id") + 1) if "user_id" in ordered_cols else "A"
+
+    print(f"🔄 Writing lookup tab: {LOOKUP_TAB}")
+    for attempt in range(1, 6):
+        try:
+            time.sleep(2)
+            try:
+                ws = sheet.worksheet(LOOKUP_TAB)
+                ws.clear()
+            except gspread.exceptions.WorksheetNotFound:
+                ws = sheet.add_worksheet(title=LOOKUP_TAB, rows=max(n_rows + 20, 100), cols=max(n_cols + 2, 26))
+
+            conds = []
+            if batch_col:
+                conds.append(f"(ISNUMBER(SEARCH($B$3,'{MASTER_VIEW_TAB}'!{batch_col}2:{batch_col}{last_row}))+($B$3=\"\"))")
+            conds.append(f"((TO_TEXT('{MASTER_VIEW_TAB}'!{uid_col}2:{uid_col}{last_row})=TO_TEXT($B$4))+($B$4=\"\"))")
+            filter_formula = (
+                f"=IFERROR(FILTER('{MASTER_VIEW_TAB}'!A2:{last_col}{last_row}, {'*'.join(conds)}), "
+                f"\"No matches — check the batch name / user ID, or clear both boxes to see everyone.\")"
+            )
+
+            rows_to_write = [
+                ["STUDENT LOOKUP — fill in either box below (or both, or neither for everyone) and matching rows appear underneath."],
+                [],
+                ["Batch name contains:", ""],
+                ["User ID equals:", ""],
+                [],
+                ordered_cols,
+                [filter_formula],
+            ]
+            ws.update(range_name="A1", values=rows_to_write, value_input_option="USER_ENTERED")
+            print(f"✅ Wrote: {LOOKUP_TAB}")
+            return
+        except gspread.exceptions.APIError as e:
+            if "RESOURCE_EXHAUSTED" in str(e) or "Quota exceeded" in str(e):
+                wait = 60 * attempt
+                print(f"⏳ Rate limit hit, waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"❌ Sheets API error writing {LOOKUP_TAB}: {e}")
+                raise
+    raise RuntimeError(f"❌ Failed to write {LOOKUP_TAB} after 5 attempts.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
 def score_month(y, m, tab_name, roster):
@@ -927,8 +1222,20 @@ if __name__ == "__main__":
         if len(months) > 1:
             time.sleep(3)  # be gentle on the Sheets API across many writes
 
-    # NOTE: no placement-sheet interaction of any kind happens in this
-    # script — see the top-of-file note.
+    # Student Master View + Student Lookup — rebuilt fresh every run from
+    # whatever month tabs currently exist (not just the ones scored just
+    # now). Best-effort: a failure here is logged and does NOT fail the run
+    # or affect the exit code — the per-month scoring above is what matters.
+    try:
+        sheet_obj = gc.open_by_key(LEARNING_SCORE_SHEET_KEY)
+        master_df, ordered_cols = build_student_master_view(sheet_obj, roster)
+        if master_df is not None:
+            write_sheet(LEARNING_SCORE_SHEET_KEY, MASTER_VIEW_TAB, master_df)
+            write_lookup_tab(sheet_obj, master_df, ordered_cols)
+    except Exception:
+        print("\n⚠️  Student Master View / Lookup build failed (non-fatal — "
+              "per-month scoring above already succeeded):")
+        traceback.print_exc()
 
     elapsed = time.time() - start_time
     scored = len(months) - len(failures)
