@@ -7,29 +7,55 @@ name: Learning Score Cron
 # Reuses the same two secrets (METABASE_API_KEY, SERVICE_ACCOUNT_JSON) your
 # other crons (Module_contest / Data Pipeline Automation) already have set
 # at the repo or org level — nothing new to add there.
+#
+# Added 2026-09-22: run_month_mode also accepts "backfill", which scores
+# EVERY month from backfill_start_month through backfill_end_month
+# (inclusive) in one run — e.g. start="2025-12" with end left blank scores
+# Dec-2025 through the last fully completed month, all in one go. Use
+# "Run workflow" (workflow_dispatch) manually for this — the scheduled
+# monthly trigger below always uses the default "previous" mode.
+#
+# Added 2026-09-23: every run (any mode) now also rebuilds two extra tabs —
+# "Student Master View" (one row per student, every scored month combined)
+# and "Student Lookup" (fill in a batch name / user ID, matching rows
+# appear). No new inputs/secrets needed — see learning_score_cron.py's
+# docstring for the full explanation.
 
 on:
   schedule:
     # 01:00 UTC on the 1st of every month = 06:30 IST — runs just after the
     # previous month has fully ended. Adjust the minute/hour if you'd rather
     # it run at a different time; GitHub Actions cron is always UTC.
-    - cron: '30 21 * * *'    # 8:00 AM IST (2:30 UTC)
-    - cron: '30 9 * * *'
+    - cron: "0 1 1 * *"
   workflow_dispatch:
     inputs:
       run_month_mode:
-        description: "Score 'previous' (default) month or 'current' month-to-date"
+        description: "Score 'previous' (default) month, 'current' month-to-date, or 'backfill' a whole range"
         required: false
         default: "previous"
         type: choice
         options:
           - previous
           - current
+          - backfill
+      backfill_start_month:
+        description: "Backfill only — first month to score, as YYYY-MM (e.g. 2025-12)"
+        required: false
+        default: "2025-12"
+      backfill_end_month:
+        description: "Backfill only — last month to score, as YYYY-MM. Leave blank for the last fully completed month."
+        required: false
+        default: ""
 
 jobs:
   run-learning-score:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Bumped from 45 — a multi-month backfill re-fetches the assignments
+    # (#7939) and TA sessions (#9251) cards once per month plus writes two
+    # sheet tabs per month, so a ~9-month backfill needs real headroom. A
+    # normal single-month run ("previous"/"current") still finishes in a
+    # few minutes either way.
+    timeout-minutes: 180
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -46,9 +72,7 @@ jobs:
         env:
           METABASE_API_KEY: ${{ secrets.METABASE_API_KEY }}
           SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
-          # Optional — only needed once you have the Groomers/Master Data
-          # sheet ID for Placement Profile Tags. Leave unset to skip that
-          # section cleanly.
-          GROOMERS_SHEET_KEY: ${{ secrets.GROOMERS_SHEET_KEY }}
           RUN_MONTH_MODE: ${{ github.event.inputs.run_month_mode || 'previous' }}
+          BACKFILL_START_MONTH: ${{ github.event.inputs.backfill_start_month }}
+          BACKFILL_END_MONTH: ${{ github.event.inputs.backfill_end_month }}
         run: python learning_score_cron.py
