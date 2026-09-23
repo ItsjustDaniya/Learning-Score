@@ -164,9 +164,48 @@ view instead of having to rebuild "Placements x Batch" by hand each time:
         batch-level average tracks learning_score's batch-level average
         (the "driver"), plus a full batch x persona_bucket breakdown table
         so persona (student mix) doesn't get mistaken for a real batch
-        effect.
-    All four are computed fresh in Python/pandas every run from whatever's
-    currently in the sheet — nothing here is a one-time snapshot.
+        effect. ADDED 2026-09-23 (3rd update):
+          - performance_vs_avg / top_strength / watch_out columns on every
+            row of BATCH OVERVIEW, PERSONA OVERVIEW and the batch x persona
+            cross-tab — the auto-generated "what was good/bad here" verdict,
+            so you don't have to eyeball the numbers yourself.
+          - best_persona_in_batch on BATCH OVERVIEW — which persona bucket
+            scored highest WITHIN that one batch, and why (that persona's
+            own top_strength), computed only from personas with >=
+            MIN_GROUP_N students in that batch.
+          - Per-module breakdown columns on Student Master View (and picked
+            up automatically by all the sub_cols-driven tables above) for
+            module contests (5 modules — data already existed, just wasn't
+            surfaced before) AND assignments (9 modules — NEW: card #7939's
+            saved SQL was confirmed 2026-09-23 to be grain user x course x
+            module, not pre-aggregated as first assumed; build_assignments()
+            now returns a per-module breakdown too, written each run to a
+            new "<month> - Assignments (per module)" tab, same pattern as
+            the existing Module Contests one — see ASSIGNMENT_MODULE_LABELS).
+            Only the LATEST scored month gets this breakdown merged in,
+            and — for assignments specifically — only for months scored
+            AFTER this update (the per-module numbers weren't kept before,
+            so there's nothing to backfill from for older months).
+          - Attendance deliberately has NO equivalent per-subject (SQL/
+            Python/Spreadsheets/...) breakdown — confirmed 2026-09-23 that
+            card #11636's saved query has no lecture-topic/module column in
+            its output at all (title is used only to filter rows out, never
+            selected). See build_student_master_view()'s docstring for the
+            two real options if you want this later; this script does NOT
+            fake it via batch-name text parsing.
+          - BATCH MONTHLY TREND / BATCH DROPS DETECTED (+ the PERSONA
+            equivalents) — a month-by-month learning_score trend per batch/
+            persona, and every month-over-month decline of DROP_THRESHOLD
+            (5) points or more, each flagged with whichever raw sub-metric
+            (attendance/assignment/module_contest/project/session/arena)
+            fell the most in that same transition as the "likely driver".
+            This is descriptive (biggest co-decline), not a causal proof —
+            it tells you where and when to look, not why it happened
+            operationally. Uses each month's OWN recorded batch per student
+            (not the current roster batch), so a rare batch transfer
+            doesn't misattribute history.
+    All of the above are computed fresh in Python/pandas every run from
+    whatever's currently in the sheet — nothing here is a one-time snapshot.
   - IMPORTANT re: the placements-sheet boundary from earlier — this reads
     the "Placement Corr" tab, which lives INSIDE this same Learning Score
     sheet (the one you already maintain yourself via IMPORTRANGE). The
@@ -354,6 +393,25 @@ MODULE_NAME_MAP = {
     "EDA - 2": "DS 07 EDA 2",   # MCQ-only, per your existing calculate_total_score()
 }
 MCQ_ONLY_MODULES = {"DS 03 Power BI", "DS 07 EDA 2"}
+
+# Assignment card #7939's real grain is user x course x MODULE (module_name
+# sourced from technologies_topictemplate.title) — confirmed 2026-09-23 by
+# reading its saved SQL directly, after build_assignments() had been
+# silently averaging this dimension away since the first version of this
+# script. It covers all 9 curriculum modules (module contests above only
+# cover 5), so this gets its own label map rather than reusing
+# MODULE_NAME_MAP.
+ASSIGNMENT_MODULE_LABELS = {
+    "DS 01 Maths":        "Maths",
+    "DS 02 Spreadsheets":  "Excel",
+    "DS 03 Power BI":      "Power BI",
+    "DS 04 SQL":           "SQL",
+    "DS 05 Python":        "Python",
+    "DS 06 EDA 1":         "EDA - 1",
+    "DS 07 EDA 2":         "EDA - 2",
+    "DS 08 ML 1":          "ML - 1",
+    "DS 09 ML 2":          "ML - 2",
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -670,13 +728,15 @@ def build_attendance(y, m):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ASSIGNMENTS  → assignment_score (0-100)
+# ASSIGNMENTS  → assignment_score (0-100), per module + averaged
 # Card #7939 is genuinely user-level (verified from its saved native SQL) and
-# already returns pre-computed 0-100 completion percentages — but as ONE
-# cumulative row per user per module, no row-level completion date. Its
-# `Date` template tag scopes which assignments count by RELEASE date, so
-# it's fetched here with that parameter set to the target month, separately
-# from the blind prefetch (which can't parameterize per-card).
+# already returns pre-computed 0-100 completion percentages — one row per
+# user PER MODULE (module_name column, confirmed 2026-09-23 by reading its
+# saved SQL — see ASSIGNMENT_MODULE_LABELS above), not pre-aggregated as
+# originally assumed. Its `Date` template tag scopes which assignments count
+# by RELEASE date, so it's fetched here with that parameter set to the
+# target month, separately from the blind prefetch (which can't parameterize
+# per-card).
 # ═══════════════════════════════════════════════════════════════════════════
 def build_assignments(y, m):
     df = fetch_card_df(
@@ -692,14 +752,28 @@ def build_assignments(y, m):
             f"it may have changed since this was last verified. Columns were: {list(df.columns)}"
         )
 
+    per_module = None
+    if "module_name" in df.columns:
+        per_module = df.groupby(["user_id", "module_name"]).agg(
+            ontime_completion=(ontime_col, "mean"),
+            overall_completion=(overall_col, "mean"),
+        ).reset_index()
+        per_module["assignment_module_score"] = 0.6 * per_module["ontime_completion"] + 0.4 * per_module["overall_completion"]
+        per_module["module_label"] = per_module["module_name"].map(ASSIGNMENT_MODULE_LABELS).fillna(per_module["module_name"])
+    else:
+        print(f"⚠️  Card {ASSIGNMENTS_CARD} has no module_name column this run — per-module "
+              f"assignment breakdown will be skipped, only the aggregate assignment_score below is built.")
+
     # Both columns are already 0-100 percentages, one row per user per module —
-    # average across modules for a single per-user figure.
+    # average across modules for a single per-user figure (unchanged from the
+    # original aggregate behavior — nothing downstream that only wants the
+    # single score needs to change).
     out = df.groupby("user_id").agg(
         ontime_completion=(ontime_col, "mean"),
         overall_completion=(overall_col, "mean"),
     ).reset_index()
     out["assignment_score"] = 0.6 * out["ontime_completion"] + 0.4 * out["overall_completion"]
-    return out
+    return per_module, out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1015,13 +1089,71 @@ def _read_tab_values(sheet, tab_name):
     return values[0], values[1:]
 
 
+def _read_persona_map(sheet):
+    """Lightweight, standalone {user_id: persona_bucket} read of Placement
+    Corr, used ONLY to group the monthly batch/persona trend below — needed
+    BEFORE the full placement/persona merge further down runs (that merge
+    also needs the month loop's results already in `df`, so it can't move
+    earlier without more churn). Deliberately duplicates a little of that
+    later block's parsing rather than refactor it out — this one is
+    best-effort and silently returns {} on any failure, matching how a
+    missing/misread Placement Corr degrades everywhere else in this file."""
+    try:
+        pc_values = sheet.worksheet(PLACEMENT_CORR_TAB).get_all_values()
+        if not pc_values:
+            return {}
+        header, rows = pc_values[0], pc_values[1:]
+        idx = {key: _find_col(header, cands) for key, cands in PLACEMENT_CORR_COLS.items()}
+        if idx["user_id"] is None:
+            return {}
+        uid_i = idx["user_id"]
+        out = {}
+        for r in rows:
+            if uid_i >= len(r) or not r[uid_i].strip():
+                continue
+            uid = _uid_str(r[uid_i])
+
+            def get(key, r=r):
+                i = idx.get(key)
+                return r[i].strip() if i is not None and i < len(r) and r[i] else None
+
+            persona = _clean_persona(get("persona_updated")) or _clean_persona(get("persona_raw")) or _clean_persona(get("persona_sai"))
+            out[uid] = _persona_bucket(persona)
+        return out
+    except Exception:
+        return {}
+
+
 def build_student_master_view(sheet, roster):
     """Builds ONE wide table — a row per student, every scored month's
-    learning_score, the latest month's sub-scores, and (best-effort)
-    placement outcome + persona from the "Placement Corr" tab in THIS sheet.
-    Computed in Python/pandas, not spreadsheet formulas. Returns
-    (DataFrame, ordered_column_list), or (None, None) if there are no
-    scored month tabs yet."""
+    learning_score, the latest month's sub-scores (including, ADDED
+    2026-09-23 3rd update, a per-module breakdown for module contests and
+    assignments — see ASSIGNMENT_MODULE_LABELS/MODULE_NAME_MAP), and
+    (best-effort) placement outcome + persona from the "Placement Corr" tab
+    in THIS sheet. Computed in Python/pandas, not spreadsheet formulas.
+
+    Also returns two long-format monthly trend tables (batch_monthly_df,
+    persona_monthly_df — one row per group per month, learning_score + every
+    sub-metric averaged) that build_batch_diagnostic_view() uses for month-
+    over-month drop detection.
+
+    Returns (DataFrame, ordered_column_list, batch_monthly_df,
+    persona_monthly_df), or (None, None, None, None) if there are no scored
+    month tabs yet.
+
+    NOTE ON ATTENDANCE: there is deliberately NO per-subject (SQL/Python/
+    Spreadsheets/...) breakdown of attendance_score anywhere in this file.
+    Confirmed 2026-09-23 by reading card #11636's saved SQL directly: its
+    final SELECT has no module/subject/lecture-topic column at all —
+    `video_sessions_lecture.title` is read only to EXCLUDE rows ('%alum%'/
+    '%orientation%'/'%guest%'/'%project%'), never projected into the output.
+    The only text fields are batch_name/au_batch_name (the batch's own name,
+    not a per-lecture topic) — parsing a subject out of those would be
+    unreliable (inconsistent naming, doesn't cover most batches) so this
+    script doesn't fake it. To get this for real: either have whoever owns
+    that Metabase question add a join to whatever table classifies lectures
+    by subject/module, or accept a rough batch-name-text-parse knowing it'll
+    be incomplete and noisy — say the word if you want the latter anyway."""
     print("\n" + "=" * 60)
     print("BUILDING STUDENT MASTER VIEW")
     print("=" * 60)
@@ -1029,8 +1161,10 @@ def build_student_master_view(sheet, roster):
     month_tabs = discover_month_tabs(sheet)
     if not month_tabs:
         print("⚠️  No scored month tabs found in the sheet yet — skipping master view.")
-        return None, None
+        return None, None, None, None
     print(f"📅 Found {len(month_tabs)} scored month tab(s): {', '.join(month_tabs)}")
+
+    persona_map = _read_persona_map(sheet)  # for monthly batch/persona grouping only — see docstring above
 
     keep = [c for c in ["user_id", "student_name", "email", "au_batch_name", "label", "gem_label"] if c in roster.columns]
     df = roster[keep].copy()
@@ -1038,6 +1172,7 @@ def build_student_master_view(sheet, roster):
     df["user_id"] = df["user_id"].apply(_uid_str)
 
     month_cols = []
+    batch_monthly_rows, persona_monthly_rows = [], []
     latest_tab, latest_by_uid = None, None
     for tab in month_tabs:
         print(f"  → reading '{tab}'...")
@@ -1048,10 +1183,39 @@ def build_student_master_view(sheet, roster):
         mdf = pd.DataFrame(rows, columns=header)
         mdf["user_id"] = mdf["user_id"].apply(_uid_str)
         mdf["learning_score"] = pd.to_numeric(mdf.get("learning_score"), errors="coerce")
+        for c in MASTER_VIEW_SUB_SCORE_COLS:
+            if c in mdf.columns:
+                mdf[c] = pd.to_numeric(mdf[c], errors="coerce")
         col_name = f"{tab} LS"
         df[col_name] = df["user_id"].map(mdf.set_index("user_id")["learning_score"])
         month_cols.append(col_name)
         latest_tab, latest_by_uid = tab, mdf.set_index("user_id")  # ends on the chronologically-last tab
+
+        # Monthly batch/persona aggregates, for build_batch_diagnostic_view()'s
+        # drop detection — uses THIS MONTH'S OWN au_batch_name (the batch each
+        # student was actually recorded in that month), not the current
+        # roster's batch, so a rare batch transfer doesn't misattribute past
+        # months to the student's current batch.
+        agg_cols = ["learning_score"] + [c for c in MASTER_VIEW_SUB_SCORE_COLS if c in mdf.columns]
+        if "au_batch_name" in mdf.columns:
+            batch_grp_m = mdf.groupby("au_batch_name", dropna=False).agg(
+                n=("user_id", "count"), **{c: (c, "mean") for c in agg_cols}
+            ).reset_index()
+            for _, r_ in batch_grp_m.iterrows():
+                b_label = r_["au_batch_name"] if pd.notna(r_["au_batch_name"]) else "(no batch)"
+                batch_monthly_rows.append({"batch": b_label, "month": tab, "n": int(r_["n"]),
+                                            **{c: r_[c] for c in agg_cols}})
+        mdf["persona_bucket"] = mdf["user_id"].map(persona_map)
+        persona_grp_m = mdf.groupby("persona_bucket", dropna=False).agg(
+            n=("user_id", "count"), **{c: (c, "mean") for c in agg_cols}
+        ).reset_index()
+        for _, r_ in persona_grp_m.iterrows():
+            p_label = r_["persona_bucket"] if pd.notna(r_["persona_bucket"]) else "(no persona data)"
+            persona_monthly_rows.append({"persona_bucket": p_label, "month": tab, "n": int(r_["n"]),
+                                          **{c: r_[c] for c in agg_cols}})
+
+    batch_monthly_df = pd.DataFrame(batch_monthly_rows) if batch_monthly_rows else pd.DataFrame()
+    persona_monthly_df = pd.DataFrame(persona_monthly_rows) if persona_monthly_rows else pd.DataFrame()
 
     if month_cols:
         df["avg_learning_score"] = df[month_cols].mean(axis=1, skipna=True).round(1)
@@ -1064,6 +1228,43 @@ def build_student_master_view(sheet, roster):
         for c in MASTER_VIEW_SUB_SCORE_COLS:
             out_col = f"latest ({latest_tab}) {c}"
             df[out_col] = df["user_id"].map(pd.to_numeric(latest_by_uid[c], errors="coerce")) if c in latest_by_uid.columns else np.nan
+
+    # ── Per-module breakdown, LATEST month only — module contests (5
+    # modules, this companion tab has always existed) and assignments (9
+    # modules, companion tab ADDED 2026-09-23 3rd update — so this will be
+    # empty for any month scored BEFORE this update; nothing to backfill it
+    # from, the raw per-module numbers were never kept). See ATTENDANCE note
+    # in this function's docstring for why there's no equivalent here. ──
+    module_contest_cols, assignment_module_cols = [], []
+    if latest_tab:
+        mc_tab = f"{latest_tab} - Module Contests (per module)"
+        try:
+            mc_header, mc_rows = _read_tab_values(sheet, mc_tab)
+            if mc_header and "user_id" in mc_header and "module_label" in mc_header:
+                mc_df = pd.DataFrame(mc_rows, columns=mc_header)
+                mc_df["user_id"] = mc_df["user_id"].apply(_uid_str)
+                mc_df["avg_score"] = pd.to_numeric(mc_df.get("avg_score"), errors="coerce")
+                for label, g in mc_df.groupby("module_label"):
+                    out_col = f"latest ({latest_tab}) module_contest — {label}"
+                    df[out_col] = df["user_id"].map(g.set_index("user_id")["avg_score"])
+                    module_contest_cols.append(out_col)
+        except gspread.exceptions.WorksheetNotFound:
+            print(f"⚠️  '{mc_tab}' tab not found — per-module contest breakdown skipped this run.")
+
+        am_tab = f"{latest_tab} - Assignments (per module)"
+        try:
+            am_header, am_rows = _read_tab_values(sheet, am_tab)
+            if am_header and "user_id" in am_header and "module_label" in am_header:
+                am_df = pd.DataFrame(am_rows, columns=am_header)
+                am_df["user_id"] = am_df["user_id"].apply(_uid_str)
+                am_df["assignment_module_score"] = pd.to_numeric(am_df.get("assignment_module_score"), errors="coerce")
+                for label, g in am_df.groupby("module_label"):
+                    out_col = f"latest ({latest_tab}) assignment — {label}"
+                    df[out_col] = df["user_id"].map(g.set_index("user_id")["assignment_module_score"])
+                    assignment_module_cols.append(out_col)
+        except gspread.exceptions.WorksheetNotFound:
+            print(f"⚠️  '{am_tab}' tab not found (expected for any month scored before the "
+                  "2026-09-23 update that added it) — per-module assignment breakdown skipped this run.")
 
     # ── Placement Corr — a tab in THIS sheet, see file docstring's 2026-09-23 note ──
     placement_cols = ["placement_status", "placement_month", "placeability",
@@ -1138,10 +1339,12 @@ def build_student_master_view(sheet, roster):
     ordered_cols += ["avg_learning_score", "months_with_data", "score_trend"]
     if latest_by_uid is not None:
         ordered_cols += [f"latest ({latest_tab}) {c}" for c in MASTER_VIEW_SUB_SCORE_COLS]
+    ordered_cols += module_contest_cols
+    ordered_cols += assignment_module_cols
     ordered_cols += placement_cols
     ordered_cols += ["picked_for_placement", "in_placement_corr"]
     ordered_cols = [c for c in ordered_cols if c in df.columns]
-    return df[ordered_cols], ordered_cols
+    return df[ordered_cols], ordered_cols, batch_monthly_df, persona_monthly_df
 
 
 def write_lookup_tab(sheet, master_view_df, ordered_cols):
@@ -1473,15 +1676,82 @@ def _summarize_rows(df, sub_cols, ls_col, benchmarks, n_col="n"):
     return perf_list, strength_list, watch_list
 
 
-def build_batch_diagnostic_view(master_df, ordered_cols):
-    """Three-part report: (1) which sub-metric's batch-to-batch variation
+DROP_THRESHOLD = 5.0  # a month-over-month learning_score decline of at least this many
+                       # points counts as a "drop" worth surfacing
+
+
+def _detect_drops(monthly_df, group_col, sub_cols_raw, ls_col="learning_score"):
+    """Walks each group's (batch's or persona's) months in chronological
+    order and flags every month-over-month learning_score decline >=
+    DROP_THRESHOLD. For each flagged drop, also reports whichever sub-metric
+    fell the MOST in that same transition as the "likely driver" — this is
+    purely descriptive (biggest same-month co-decline), not a causal claim;
+    it tells you where to look, not why it happened operationally that
+    month. Returns a list of dicts, or [] if `monthly_df` is empty/None."""
+    if monthly_df is None or monthly_df.empty:
+        return []
+    monthly_df = monthly_df.copy()
+    monthly_df["_ym"] = monthly_df["month"].apply(lambda t: _parse_year_month(t, "monthly trend month"))
+    drops = []
+    for g, sub in monthly_df.groupby(group_col):
+        sub = sub.sort_values("_ym")
+        prev = None
+        for _, row in sub.iterrows():
+            if prev is not None and pd.notna(row.get(ls_col)) and pd.notna(prev.get(ls_col)):
+                delta = row[ls_col] - prev[ls_col]
+                if delta <= -DROP_THRESHOLD:
+                    sub_deltas = {
+                        c: row[c] - prev[c] for c in sub_cols_raw
+                        if c in row and c in prev and pd.notna(row[c]) and pd.notna(prev[c])
+                    }
+                    driver = min(sub_deltas, key=sub_deltas.get) if sub_deltas else None
+                    drops.append({
+                        "group": g, "month": row["month"], "prev_month": prev["month"],
+                        "ls_before": round(prev[ls_col], 1), "ls_after": round(row[ls_col], 1),
+                        "delta": round(delta, 1), "n": int(row.get("n", 0)),
+                        "driver": driver, "driver_delta": round(sub_deltas[driver], 1) if driver else None,
+                    })
+            prev = row
+    return drops
+
+
+def _drops_rows(drops, group_label):
+    header = [group_label, "dropped_in_month", "from_month", "ls_before", "ls_after",
+              "delta", "n_students", "likely_driver", "driver_delta"]
+    if not drops:
+        return [header, [f"No month-over-month drop of {DROP_THRESHOLD:.0f}+ points detected."]]
+    out = [header]
+    for d in sorted(drops, key=lambda x: x["delta"]):  # biggest drops (most negative) first
+        out.append([d["group"], d["month"], d["prev_month"], d["ls_before"], d["ls_after"],
+                     d["delta"], d["n"], d["driver"], d["driver_delta"]])
+    return out
+
+
+def _monthly_trend_rows(monthly_df, group_col, group_label, ls_col="learning_score"):
+    if monthly_df is None or monthly_df.empty:
+        return [[f"No monthly {group_label} data available."]]
+    pivot = monthly_df.pivot_table(index=group_col, columns="month", values=ls_col, aggfunc="mean")
+    month_order = sorted(pivot.columns, key=lambda t: _parse_year_month(t, "trend month"))
+    pivot = pivot[month_order]
+    out = [[group_label] + month_order]
+    for g, r_ in pivot.iterrows():
+        out.append([g] + [round(v, 1) if pd.notna(v) else None for v in r_])
+    return out
+
+
+def build_batch_diagnostic_view(master_df, ordered_cols, batch_monthly_df=None, persona_monthly_df=None):
+    """Five-part report: (1) which sub-metric's batch-to-batch variation
     tracks learning_score's batch-to-batch variation most closely (the
     "driver" — e.g. attendance vs assignment vs module contest), computed
     both at student-level and batch-level; (2)/(3) a batch overview and a
-    persona overview, each row scored against the average of its peers and
-    labeled with its single biggest strength and biggest watch-out, so you
-    can read the verdict instead of comparing numbers yourself; (4) the
-    same, one level more granular, for every batch x persona_bucket cell."""
+    persona overview, each row scored against the average of its peers,
+    labeled with its single biggest strength and watch-out AND (batch
+    overview only) which persona in that batch performed best and why;
+    (4) the same, one level more granular, for every batch x persona_bucket
+    cell; (5), if batch_monthly_df/persona_monthly_df are supplied (from
+    build_student_master_view()), a month-by-month trend table and a list
+    of every flagged month-over-month learning_score drop with its likely
+    driving sub-metric — the "deep dive... which month" piece."""
     rows = [
         ["BATCH x PERSONA DIAGNOSTIC — auto-rebuilt every cron run from this sheet's own data."],
         ["Which sub-metric explains batch-to-batch differences in learning_score, and the same "
@@ -1521,13 +1791,37 @@ def build_batch_diagnostic_view(master_df, ordered_cols):
 
     summary_header = ["performance_vs_avg", "top_strength", "watch_out"]
 
+    # Batch x persona cross-tab, computed HERE (rather than down at "BATCH x
+    # PERSONA BREAKDOWN") so BATCH OVERVIEW below can pull "which persona
+    # performed best in this batch, and why" straight from each cell's own
+    # top_strength — no separate computation, no risk of the two disagreeing.
+    grp = df.groupby(["batch", "persona_bucket"], dropna=False).agg(
+        n=("user_id", "count"),
+        **{latest_ls_col: (latest_ls_col, "mean")},
+        **{c: (c, "mean") for c in sub_cols},
+    ).reset_index()
+    cross_bm = _group_benchmarks(grp, sub_cols, latest_ls_col)
+    perf, strength, watch = _summarize_rows(grp, sub_cols, latest_ls_col, cross_bm)
+    grp["performance_vs_avg"], grp["top_strength"], grp["watch_out"] = perf, strength, watch
+
+    best_persona_of = {}
+    for b, sub in grp[grp["n"] >= MIN_GROUP_N].groupby("batch"):
+        if sub.empty or sub[latest_ls_col].isna().all():
+            continue
+        best = sub.loc[sub[latest_ls_col].idxmax()]
+        label = best["persona_bucket"] if pd.notna(best["persona_bucket"]) else "(no persona data)"
+        why = best["top_strength"] if best["top_strength"] not in (None, "—") else "no single sub-metric stands out vs benchmark"
+        best_persona_of[b] = f"{label} ({best[latest_ls_col]:.1f} LS) — best on {why}" if why != "no single sub-metric stands out vs benchmark" else f"{label} ({best[latest_ls_col]:.1f} LS) — {why}"
+
     # ── BATCH OVERVIEW — one row per batch, every persona pooled ───────────
     rows.append([])
     rows.append([f"BATCH OVERVIEW (latest month) — each batch scored against the average of "
                   f"batches with >= {MIN_GROUP_N} students; top_strength/watch_out only shown "
                   f"when a sub-metric clears +/-{STRENGTH_THRESHOLD:.0f} pts, so a genuinely flat "
-                  "batch gets '—' instead of a forced pick"])
-    rows.append(["batch", "n", latest_ls_col] + sub_cols + summary_header)
+                  "batch gets '—' instead of a forced pick. best_persona compares personas WITHIN "
+                  f"this one batch (only personas with >= {MIN_GROUP_N} students in this batch are "
+                  "considered)"])
+    rows.append(["batch", "n", latest_ls_col] + sub_cols + summary_header + ["best_persona_in_batch"])
     batch_grp = df.groupby("batch", dropna=False).agg(
         n=("user_id", "count"),
         **{latest_ls_col: (latest_ls_col, "mean")},
@@ -1541,6 +1835,7 @@ def build_batch_diagnostic_view(master_df, ordered_cols):
         row = [r_["batch"], int(r_["n"]), round(r_[latest_ls_col], 1) if pd.notna(r_[latest_ls_col]) else None]
         row += [round(r_[c], 1) if pd.notna(r_[c]) else None for c in sub_cols]
         row += [r_["performance_vs_avg"], r_["top_strength"], r_["watch_out"]]
+        row += [best_persona_of.get(r_["batch"], "no persona group in this batch has enough students")]
         rows.append(row)
 
     # ── PERSONA OVERVIEW — one row per persona_bucket, every batch pooled ──
@@ -1564,26 +1859,48 @@ def build_batch_diagnostic_view(master_df, ordered_cols):
         rows.append(row)
 
     # ── BATCH x PERSONA BREAKDOWN — the granular cross-tab, same treatment ─
+    # (reuses `grp`, already computed above so BATCH OVERVIEW's best_persona
+    # column reads exactly the same numbers as this table.)
     rows.append([])
     rows.append(["BATCH x PERSONA BREAKDOWN (latest month) — same batch/persona benchmarks as above, "
                   "applied cell by cell"])
     rows.append(["batch", "persona_bucket", "n", latest_ls_col] + sub_cols + summary_header)
-    grp = df.groupby(["batch", "persona_bucket"], dropna=False).agg(
-        n=("user_id", "count"),
-        **{latest_ls_col: (latest_ls_col, "mean")},
-        **{c: (c, "mean") for c in sub_cols},
-    ).reset_index()
-    cross_bm = _group_benchmarks(grp, sub_cols, latest_ls_col)
-    perf, strength, watch = _summarize_rows(grp, sub_cols, latest_ls_col, cross_bm)
-    grp["performance_vs_avg"], grp["top_strength"], grp["watch_out"] = perf, strength, watch
-    grp = grp.sort_values(["batch", "n"], ascending=[True, False])
-    for _, r_ in grp.iterrows():
+    grp_sorted = grp.sort_values(["batch", "n"], ascending=[True, False])
+    for _, r_ in grp_sorted.iterrows():
         persona_label = r_["persona_bucket"] if pd.notna(r_["persona_bucket"]) else "(no persona data)"
         row = [r_["batch"], persona_label, int(r_["n"]),
                round(r_[latest_ls_col], 1) if pd.notna(r_[latest_ls_col]) else None]
         row += [round(r_[c], 1) if pd.notna(r_[c]) else None for c in sub_cols]
         row += [r_["performance_vs_avg"], r_["top_strength"], r_["watch_out"]]
         rows.append(row)
+
+    # ── MONTHLY TREND + DROP DETECTION — "deep dive if there's a drop, and
+    # which month" — uses the RAW aggregate sub-scores only (attendance/
+    # assignment/module_contest/project/session/arena), not the per-module
+    # breakdown, since those companion tabs don't exist for every past month.
+    rows.append([])
+    rows.append(["BATCH MONTHLY TREND (learning_score, batch-level average) — see BATCH DROPS "
+                  "DETECTED right below for flagged declines"])
+    for r in _monthly_trend_rows(batch_monthly_df, "batch", "batch"):
+        rows.append(r)
+
+    rows.append([])
+    rows.append([f"BATCH DROPS DETECTED — month-over-month learning_score declines of "
+                  f"{DROP_THRESHOLD:.0f}+ points, with whichever sub-metric fell the most in that "
+                  "same transition flagged as the likely driver (descriptive, not proof — worth a "
+                  "human look at what actually changed operationally that month)"])
+    for r in _drops_rows(_detect_drops(batch_monthly_df, "batch", MASTER_VIEW_SUB_SCORE_COLS), "batch"):
+        rows.append(r)
+
+    rows.append([])
+    rows.append(["PERSONA MONTHLY TREND (learning_score, persona-level average, pooled across batches)"])
+    for r in _monthly_trend_rows(persona_monthly_df, "persona_bucket", "persona_bucket"):
+        rows.append(r)
+
+    rows.append([])
+    rows.append(["PERSONA DROPS DETECTED — same idea, pooled across batches"])
+    for r in _drops_rows(_detect_drops(persona_monthly_df, "persona_bucket", MASTER_VIEW_SUB_SCORE_COLS), "persona_bucket"):
+        rows.append(r)
 
     return rows
 
@@ -1598,7 +1915,7 @@ def score_month(y, m, tab_name, roster):
     only the two cards that are scoped server-side per month (assignments
     #7939, TA sessions #9251). Returns the number of users scored."""
     attendance = build_attendance(y, m)
-    assignments = build_assignments(y, m)
+    per_module_assignments, assignments = build_assignments(y, m)
     per_module_contests, module_contests = build_module_contests(y, m)
     projects = build_projects(y, m)
     arena = build_arena(y, m)
@@ -1624,6 +1941,8 @@ def score_month(y, m, tab_name, roster):
 
     write_sheet(LEARNING_SCORE_SHEET_KEY, tab_name, df)
     write_sheet(LEARNING_SCORE_SHEET_KEY, f"{tab_name} - Module Contests (per module)", per_module_contests)
+    if per_module_assignments is not None:
+        write_sheet(LEARNING_SCORE_SHEET_KEY, f"{tab_name} - Assignments (per module)", per_module_assignments)
     return len(df)
 
 
@@ -1678,7 +1997,7 @@ if __name__ == "__main__":
     # or affect the exit code — the per-month scoring above is what matters.
     try:
         sheet_obj = gc.open_by_key(LEARNING_SCORE_SHEET_KEY)
-        master_df, ordered_cols = build_student_master_view(sheet_obj, roster)
+        master_df, ordered_cols, batch_monthly_df, persona_monthly_df = build_student_master_view(sheet_obj, roster)
         if master_df is not None:
             write_sheet(LEARNING_SCORE_SHEET_KEY, MASTER_VIEW_TAB, master_df)
             write_lookup_tab(sheet_obj, master_df, ordered_cols)
@@ -1686,7 +2005,7 @@ if __name__ == "__main__":
             correlation_rows = build_placement_correlation_view(master_df, ordered_cols)
             write_blocks_tab(sheet_obj, CORRELATION_TAB, correlation_rows)
 
-            diagnostic_rows = build_batch_diagnostic_view(master_df, ordered_cols)
+            diagnostic_rows = build_batch_diagnostic_view(master_df, ordered_cols, batch_monthly_df, persona_monthly_df)
             write_blocks_tab(sheet_obj, BATCH_DIAGNOSTIC_TAB, diagnostic_rows)
     except Exception:
         print("\n⚠️  Student Master View / Lookup / Correlation build failed (non-fatal — "
