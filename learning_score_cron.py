@@ -150,6 +150,14 @@ view instead of having to rebuild "Placements x Batch" by hand each time:
         in/through the placement pipeline) — everyone else has no
         placement outcome yet, so they're excluded rather than counted as
         "not placed" (see in_placement_corr in build_student_master_view()).
+        ADDED 2026-09-23 (2nd update): the BY BATCH / BY PERSONA BUCKET
+        tables now also show n_picked / pick_rate_% — how many students,
+        out of the WHOLE batch/persona (not just those already in the
+        placement pipeline), have been picked into the grooming pool
+        (Placement Corr's "Status" column == Picked/Returned). This is a
+        different, earlier-funnel metric than placement_rate_% (picked vs
+        actually placed) — see build_placement_correlation_view()'s
+        docstring for the exact denominators.
       • "Batch x Persona Diagnostic" — automates the "why is one batch
         doing better" analysis: ranks each sub-metric (attendance/
         assignment/module contest/project/session) by how strongly its
@@ -920,7 +928,18 @@ PLACEMENT_CORR_COLS = {
     "persona_updated": ["Persona UPDATED"],
     "persona_raw":     ["Persona"],
     "persona_sai":     ["Persona (Sai sheet)"],
+    "status":          ["Status"],        # funnel stage: Not recommended / To be picked / Picked / Returned
+    "picked_date":     ["Picked Date"],   # fallback signal if "Status" text ever changes
 }
+
+# "Got picked for placement" = made it past PI recommendation into the
+# grooming pool — confirmed from your actual "Status" column (2026-09-23):
+# values are "Not recommended" / "To be picked" / "Picked" / "Returned".
+# "Returned" counts as picked too (a "Return to PI Date"/"Return Reason"
+# pair only makes sense for someone who WAS picked and got sent back) — if
+# you'd rather count only currently-active-in-grooming students, drop
+# "returned" from this set.
+_PICKED_STATUSES = {"picked", "returned"}
 
 _PERSONA_JUNK = {"", "na", "n/a", "#n/a", "data not found", "value could not found", "none"}
 _PERSONA_BUCKETS = ("Moonshot", "Excellent", "Good", "Average", "Weak")
@@ -1048,7 +1067,8 @@ def build_student_master_view(sheet, roster):
 
     # ── Placement Corr — a tab in THIS sheet, see file docstring's 2026-09-23 note ──
     placement_cols = ["placement_status", "placement_month", "placeability",
-                       "placement_pipeline_batch", "persona", "persona_bucket"]
+                       "placement_pipeline_batch", "persona", "persona_bucket",
+                       "placement_pick_status"]
     for c in placement_cols:
         df[c] = None
     # Separate from placement_status: TRUE means this student has a row in
@@ -1059,6 +1079,13 @@ def build_student_master_view(sheet, roster):
     # relies on this distinction so it doesn't miscount every not-yet-
     # eligible student as a placement failure.
     df["in_placement_corr"] = False
+    # TRUE once a student has been PICKED into the grooming pool (Status ==
+    # "Picked"/"Returned" — see _PICKED_STATUSES) — an earlier funnel stage
+    # than actually being placed. Defaults False (not None) for everyone,
+    # including students never in Placement Corr at all, so batch/persona
+    # pick-rate can be computed straight from this column with a plain
+    # .sum() over the WHOLE roster, not just the placement-pipeline subset.
+    df["picked_for_placement"] = False
     try:
         pc_values = sheet.worksheet(PLACEMENT_CORR_TAB).get_all_values()
         if not pc_values:
@@ -1079,6 +1106,11 @@ def build_student_master_view(sheet, roster):
                 return r[i].strip() if i is not None and i < len(r) and r[i] else None
 
             persona = _clean_persona(get("persona_updated")) or _clean_persona(get("persona_raw")) or _clean_persona(get("persona_sai"))
+            status_raw = get("status")
+            is_picked = (
+                status_raw.strip().lower() in _PICKED_STATUSES if status_raw
+                else bool(get("picked_date"))  # fallback if "Status" text ever changes
+            )
             pc[uid] = {
                 "placement_status": get("placed"),
                 "placement_month": get("placement_month"),
@@ -1086,12 +1118,17 @@ def build_student_master_view(sheet, roster):
                 "placement_pipeline_batch": get("batch"),
                 "persona": persona,
                 "persona_bucket": _persona_bucket(persona),
+                "placement_pick_status": status_raw,
+                "picked_for_placement": is_picked,
             }
         for c in placement_cols:
             df[c] = df["user_id"].map(lambda u, c=c: pc.get(u, {}).get(c))
+        df["picked_for_placement"] = df["user_id"].map(lambda u: pc.get(u, {}).get("picked_for_placement", False)).fillna(False).astype(bool)
         df["in_placement_corr"] = df["user_id"].isin(pc.keys())
         matched = int(df["in_placement_corr"].sum())
-        print(f"✓ Matched {matched}/{len(df)} students against '{PLACEMENT_CORR_TAB}' ({len(pc)} rows had a UserID there).")
+        n_picked_total = int(df["picked_for_placement"].sum())
+        print(f"✓ Matched {matched}/{len(df)} students against '{PLACEMENT_CORR_TAB}' ({len(pc)} rows had a UserID there); "
+              f"{n_picked_total} picked for placement.")
     except (gspread.exceptions.WorksheetNotFound, ValueError) as e:
         print(f"⚠️  Couldn't read '{PLACEMENT_CORR_TAB}' tab ({e}) — placement/persona columns "
               f"will be blank in the master view this run. Best-effort only — not fatal.")
@@ -1102,7 +1139,7 @@ def build_student_master_view(sheet, roster):
     if latest_by_uid is not None:
         ordered_cols += [f"latest ({latest_tab}) {c}" for c in MASTER_VIEW_SUB_SCORE_COLS]
     ordered_cols += placement_cols
-    ordered_cols += ["in_placement_corr"]
+    ordered_cols += ["picked_for_placement", "in_placement_corr"]
     ordered_cols = [c for c in ordered_cols if c in df.columns]
     return df[ordered_cols], ordered_cols
 
@@ -1202,6 +1239,13 @@ def _sanitize_rows(rows):
     return [[_sanitize_cell(c) for c in row] for row in rows]
 
 
+def _int_or_none(v):
+    """int(v) unless v is missing (NaN/None) — for cells built from an
+    outer-merge where one side has no matching group (e.g. a batch with
+    students but none yet in the placement pipeline)."""
+    return int(v) if pd.notna(v) else None
+
+
 def _corr_n(a, b, min_n=3):
     """Pearson r between two (possibly messy) series, dropping rows where
     either side is missing or non-numeric-coercible. Returns (r, n) — r is
@@ -1252,7 +1296,17 @@ def build_placement_correlation_view(master_df, ordered_cols):
     row there has an unknown placement status, not a confirmed "not placed",
     so including them would silently understate the placement rate and
     dilute the correlation. See build_student_master_view()'s note on
-    in_placement_corr."""
+    in_placement_corr.
+
+    The BY BATCH / BY PERSONA BUCKET tables carry two different metrics side
+    by side, with two different denominators — don't average them together:
+      • pick_rate_% = n_picked / n_total_students (EVERY student in that
+        batch/persona, whether or not they've reached the placement
+        pipeline yet) — "how many, out of everyone, got picked."
+      • placement_rate_% = n_placed / n_in_pipeline (only students already
+        in Placement Corr) — "of the ones already in the pipeline, how many
+        actually got placed."
+    """
     rows = [
         ["LS x PLACEMENT CORRELATION — auto-rebuilt every cron run from this sheet's own data."],
         ["Restricted to students with a row in 'Placement Corr' (in/through the placement "
@@ -1290,10 +1344,19 @@ def build_placement_correlation_view(master_df, ordered_cols):
         r, n = _corr_n(pool["is_placed"], pool[c])
         rows.append([c, r, n])
 
+    has_picked_col = "picked_for_placement" in master_df.columns
+    pick_header = ["n_total_students", "n_picked", "pick_rate_%"] if has_picked_col else []
+
     rows.append([])
-    rows.append([f"BY BATCH — batches with fewer than {MIN_GROUP_N} placement-pipeline students are "
-                  "shown here but excluded from the correlation line below"])
-    rows.append(["batch", "n_in_pipeline", "n_placed", "placement_rate_%", "avg_learning_score"])
+    rows.append([f"BY BATCH — pick_rate_%/placement_rate_% below {MIN_GROUP_N} students are shown but "
+                  "excluded from the correlation lines below (too small to be meaningful)"])
+    rows.append(["batch"] + pick_header + ["n_in_pipeline", "n_placed", "placement_rate_%", "avg_learning_score"])
+    if has_picked_col:
+        total_batch = master_df.groupby("batch", dropna=False).agg(
+            n_total_students=("user_id", "count"),
+            n_picked=("picked_for_placement", "sum"),
+        ).reset_index()
+        total_batch["pick_rate_%"] = (total_batch["n_picked"] / total_batch["n_total_students"] * 100).round(1)
     batch_g = pool.groupby("batch", dropna=False).agg(
         n_in_pipeline=("user_id", "count"),
         n_placed=("is_placed", "sum"),
@@ -1301,17 +1364,34 @@ def build_placement_correlation_view(master_df, ordered_cols):
     ).reset_index()
     batch_g["placement_rate_%"] = (batch_g["n_placed"] / batch_g["n_in_pipeline"] * 100).round(1)
     batch_g["avg_learning_score"] = batch_g["avg_learning_score"].round(1)
-    batch_g = batch_g.sort_values("placement_rate_%", ascending=False)
-    for _, r_ in batch_g.iterrows():
-        rows.append([r_["batch"], int(r_["n_in_pipeline"]), int(r_["n_placed"]), r_["placement_rate_%"], r_["avg_learning_score"]])
+    batch_all = total_batch.merge(batch_g, on="batch", how="outer") if has_picked_col else batch_g
+    sort_col = "pick_rate_%" if has_picked_col else "placement_rate_%"
+    batch_all = batch_all.sort_values(sort_col, ascending=False)
+    for _, r_ in batch_all.iterrows():
+        row = [r_["batch"]]
+        if has_picked_col:
+            row += [_int_or_none(r_["n_total_students"]), _int_or_none(r_["n_picked"]), r_.get("pick_rate_%")]
+        row += [_int_or_none(r_.get("n_in_pipeline")), _int_or_none(r_.get("n_placed")), r_.get("placement_rate_%"), r_.get("avg_learning_score")]
+        rows.append(row)
+    rows.append([])
+    if has_picked_col:
+        reliable_pick = batch_all[batch_all["n_total_students"] >= MIN_GROUP_N]
+        r, n = _corr_n(reliable_pick["pick_rate_%"], reliable_pick["avg_learning_score"])
+        rows.append([f"Batch-level correlation — pick rate (of total students) vs avg learning score ({n} batches, n>={MIN_GROUP_N} each)", r])
     reliable = batch_g[batch_g["n_in_pipeline"] >= MIN_GROUP_N]
     r, n = _corr_n(reliable["placement_rate_%"], reliable["avg_learning_score"])
-    rows.append([])
-    rows.append([f"Batch-level correlation — placement rate vs avg learning score ({n} batches, n>={MIN_GROUP_N} each)", r])
+    rows.append([f"Batch-level correlation — placement rate (of pipeline students) vs avg learning score ({n} batches, n>={MIN_GROUP_N} each)", r])
 
     rows.append([])
-    rows.append(["BY PERSONA BUCKET"])
-    rows.append(["persona_bucket", "n_in_pipeline", "n_placed", "placement_rate_%", "avg_learning_score"])
+    rows.append(["BY PERSONA BUCKET — '(no persona data)' mostly means 'never reached the placement "
+                  "pipeline', not 'bad persona' — see build_student_master_view()'s note"])
+    rows.append(["persona_bucket"] + pick_header + ["n_in_pipeline", "n_placed", "placement_rate_%", "avg_learning_score"])
+    if has_picked_col:
+        total_persona = master_df.groupby("persona_bucket", dropna=False).agg(
+            n_total_students=("user_id", "count"),
+            n_picked=("picked_for_placement", "sum"),
+        ).reset_index()
+        total_persona["pick_rate_%"] = (total_persona["n_picked"] / total_persona["n_total_students"] * 100).round(1)
     persona_g = pool.groupby("persona_bucket", dropna=False).agg(
         n_in_pipeline=("user_id", "count"),
         n_placed=("is_placed", "sum"),
@@ -1319,22 +1399,89 @@ def build_placement_correlation_view(master_df, ordered_cols):
     ).reset_index()
     persona_g["placement_rate_%"] = (persona_g["n_placed"] / persona_g["n_in_pipeline"] * 100).round(1)
     persona_g["avg_learning_score"] = persona_g["avg_learning_score"].round(1)
-    persona_g = persona_g.sort_values("placement_rate_%", ascending=False)
-    for _, r_ in persona_g.iterrows():
+    persona_all = total_persona.merge(persona_g, on="persona_bucket", how="outer") if has_picked_col else persona_g
+    sort_col = "pick_rate_%" if has_picked_col else "placement_rate_%"
+    persona_all = persona_all.sort_values(sort_col, ascending=False)
+    for _, r_ in persona_all.iterrows():
         label = r_["persona_bucket"] if pd.notna(r_["persona_bucket"]) else "(no persona data)"
-        rows.append([label, int(r_["n_in_pipeline"]), int(r_["n_placed"]), r_["placement_rate_%"], r_["avg_learning_score"]])
+        row = [label]
+        if has_picked_col:
+            row += [_int_or_none(r_["n_total_students"]), _int_or_none(r_["n_picked"]), r_.get("pick_rate_%")]
+        row += [_int_or_none(r_.get("n_in_pipeline")), _int_or_none(r_.get("n_placed")), r_.get("placement_rate_%"), r_.get("avg_learning_score")]
+        rows.append(row)
 
     return rows
 
 
+STRENGTH_THRESHOLD = 3.0  # points above/below the benchmark before a sub-metric counts as a
+                           # real strength/watch-out worth naming, not just noise
+
+
+def _short_metric_label(col_name):
+    """'latest (Aug-2026) attendance_score' -> 'attendance' — for compact
+    strength/watch-out text instead of the full column name."""
+    label = col_name.split(") ", 1)[-1] if ") " in col_name else col_name
+    return label.replace("_score", "")
+
+
+def _group_benchmarks(grp_df, sub_cols, ls_col, n_col="n"):
+    """Mean of each sub-metric + learning_score across the RELIABLE rows
+    (n >= MIN_GROUP_N) of a grouped table — what every row's strength/
+    watch-out gets compared against, so a single 2-student outlier group
+    can't drag the whole benchmark around."""
+    reliable = grp_df[grp_df[n_col] >= MIN_GROUP_N]
+    base = reliable if len(reliable) >= 2 else grp_df  # fall back if almost nothing qualifies as "reliable"
+    benchmarks = {c: base[c].mean() for c in sub_cols}
+    benchmarks["_ls"] = base[ls_col].mean()
+    return benchmarks
+
+
+def _summarize_rows(df, sub_cols, ls_col, benchmarks, n_col="n"):
+    """ADDED 2026-09-23 (3rd update) — the "so I don't have to analyse
+    much" columns. For each row, compares its learning_score and every
+    sub-metric against `benchmarks` (from _group_benchmarks()) and returns
+    three parallel lists: a plain performance verdict, the ONE sub-metric
+    that beats the benchmark by the most (if any clears STRENGTH_THRESHOLD),
+    and the ONE that lags the most (same threshold). A row with nothing
+    that clears the threshold either way gets "—", not a forced pick —
+    a flat batch shouldn't get a fake standout metric."""
+    perf_list, strength_list, watch_list = [], [], []
+    ls_bm = benchmarks.get("_ls")
+    for _, row in df.iterrows():
+        ls_v = row.get(ls_col)
+        if pd.notna(ls_v) and pd.notna(ls_bm):
+            d = ls_v - ls_bm
+            tag = "Above avg" if d >= STRENGTH_THRESHOLD else ("Below avg" if d <= -STRENGTH_THRESHOLD else "About avg")
+            perf_list.append(f"{tag} ({d:+.1f} LS)")
+        else:
+            perf_list.append("n/a")
+
+        deltas = {}
+        for c in sub_cols:
+            v, bm = row.get(c), benchmarks.get(c)
+            if pd.notna(v) and pd.notna(bm):
+                deltas[c] = v - bm
+        n_val = row.get(n_col)
+        low_n = " (low n)" if pd.notna(n_val) and n_val < MIN_GROUP_N else ""
+        if deltas:
+            best_c, worst_c = max(deltas, key=deltas.get), min(deltas, key=deltas.get)
+            strength_list.append(f"{_short_metric_label(best_c)} ({deltas[best_c]:+.1f}){low_n}" if deltas[best_c] >= STRENGTH_THRESHOLD else "—")
+            watch_list.append(f"{_short_metric_label(worst_c)} ({deltas[worst_c]:+.1f}){low_n}" if deltas[worst_c] <= -STRENGTH_THRESHOLD else "—")
+        else:
+            strength_list.append("n/a")
+            watch_list.append("n/a")
+    return perf_list, strength_list, watch_list
+
+
 def build_batch_diagnostic_view(master_df, ordered_cols):
-    """Two-part report: (1) which sub-metric's batch-to-batch variation
+    """Three-part report: (1) which sub-metric's batch-to-batch variation
     tracks learning_score's batch-to-batch variation most closely (the
     "driver" — e.g. attendance vs assignment vs module contest), computed
-    both at student-level and batch-level; (2) a batch x persona_bucket
-    breakdown of learning_score and every sub-metric, so you can eyeball
-    whether a batch is under-performing across the board or specifically on
-    one sub-metric, with persona held constant."""
+    both at student-level and batch-level; (2)/(3) a batch overview and a
+    persona overview, each row scored against the average of its peers and
+    labeled with its single biggest strength and biggest watch-out, so you
+    can read the verdict instead of comparing numbers yourself; (4) the
+    same, one level more granular, for every batch x persona_bucket cell."""
     rows = [
         ["BATCH x PERSONA DIAGNOSTIC — auto-rebuilt every cron run from this sheet's own data."],
         ["Which sub-metric explains batch-to-batch differences in learning_score, and the same "
@@ -1372,20 +1519,70 @@ def build_batch_diagnostic_view(master_df, ordered_cols):
     rows.append([])
     rows.append([f"(batch-level uses batches with >= {MIN_GROUP_N} students this latest month — {len(reliable_batches)} batches)"])
 
+    summary_header = ["performance_vs_avg", "top_strength", "watch_out"]
+
+    # ── BATCH OVERVIEW — one row per batch, every persona pooled ───────────
     rows.append([])
-    rows.append(["BATCH x PERSONA BREAKDOWN (latest month)"])
-    rows.append(["batch", "persona_bucket", "n", latest_ls_col] + sub_cols)
+    rows.append([f"BATCH OVERVIEW (latest month) — each batch scored against the average of "
+                  f"batches with >= {MIN_GROUP_N} students; top_strength/watch_out only shown "
+                  f"when a sub-metric clears +/-{STRENGTH_THRESHOLD:.0f} pts, so a genuinely flat "
+                  "batch gets '—' instead of a forced pick"])
+    rows.append(["batch", "n", latest_ls_col] + sub_cols + summary_header)
+    batch_grp = df.groupby("batch", dropna=False).agg(
+        n=("user_id", "count"),
+        **{latest_ls_col: (latest_ls_col, "mean")},
+        **{c: (c, "mean") for c in sub_cols},
+    ).reset_index()
+    batch_bm = _group_benchmarks(batch_grp, sub_cols, latest_ls_col)
+    perf, strength, watch = _summarize_rows(batch_grp, sub_cols, latest_ls_col, batch_bm)
+    batch_grp["performance_vs_avg"], batch_grp["top_strength"], batch_grp["watch_out"] = perf, strength, watch
+    batch_grp = batch_grp.sort_values(latest_ls_col, ascending=False)
+    for _, r_ in batch_grp.iterrows():
+        row = [r_["batch"], int(r_["n"]), round(r_[latest_ls_col], 1) if pd.notna(r_[latest_ls_col]) else None]
+        row += [round(r_[c], 1) if pd.notna(r_[c]) else None for c in sub_cols]
+        row += [r_["performance_vs_avg"], r_["top_strength"], r_["watch_out"]]
+        rows.append(row)
+
+    # ── PERSONA OVERVIEW — one row per persona_bucket, every batch pooled ──
+    rows.append([])
+    rows.append([f"PERSONA OVERVIEW (latest month) — same idea, pooled across batches instead"])
+    rows.append(["persona_bucket", "n", latest_ls_col] + sub_cols + summary_header)
+    persona_grp = df.groupby("persona_bucket", dropna=False).agg(
+        n=("user_id", "count"),
+        **{latest_ls_col: (latest_ls_col, "mean")},
+        **{c: (c, "mean") for c in sub_cols},
+    ).reset_index()
+    persona_bm = _group_benchmarks(persona_grp, sub_cols, latest_ls_col)
+    perf, strength, watch = _summarize_rows(persona_grp, sub_cols, latest_ls_col, persona_bm)
+    persona_grp["performance_vs_avg"], persona_grp["top_strength"], persona_grp["watch_out"] = perf, strength, watch
+    persona_grp = persona_grp.sort_values(latest_ls_col, ascending=False)
+    for _, r_ in persona_grp.iterrows():
+        label = r_["persona_bucket"] if pd.notna(r_["persona_bucket"]) else "(no persona data)"
+        row = [label, int(r_["n"]), round(r_[latest_ls_col], 1) if pd.notna(r_[latest_ls_col]) else None]
+        row += [round(r_[c], 1) if pd.notna(r_[c]) else None for c in sub_cols]
+        row += [r_["performance_vs_avg"], r_["top_strength"], r_["watch_out"]]
+        rows.append(row)
+
+    # ── BATCH x PERSONA BREAKDOWN — the granular cross-tab, same treatment ─
+    rows.append([])
+    rows.append(["BATCH x PERSONA BREAKDOWN (latest month) — same batch/persona benchmarks as above, "
+                  "applied cell by cell"])
+    rows.append(["batch", "persona_bucket", "n", latest_ls_col] + sub_cols + summary_header)
     grp = df.groupby(["batch", "persona_bucket"], dropna=False).agg(
         n=("user_id", "count"),
         **{latest_ls_col: (latest_ls_col, "mean")},
         **{c: (c, "mean") for c in sub_cols},
     ).reset_index()
+    cross_bm = _group_benchmarks(grp, sub_cols, latest_ls_col)
+    perf, strength, watch = _summarize_rows(grp, sub_cols, latest_ls_col, cross_bm)
+    grp["performance_vs_avg"], grp["top_strength"], grp["watch_out"] = perf, strength, watch
     grp = grp.sort_values(["batch", "n"], ascending=[True, False])
     for _, r_ in grp.iterrows():
         persona_label = r_["persona_bucket"] if pd.notna(r_["persona_bucket"]) else "(no persona data)"
         row = [r_["batch"], persona_label, int(r_["n"]),
                round(r_[latest_ls_col], 1) if pd.notna(r_[latest_ls_col]) else None]
         row += [round(r_[c], 1) if pd.notna(r_[c]) else None for c in sub_cols]
+        row += [r_["performance_vs_avg"], r_["top_strength"], r_["watch_out"]]
         rows.append(row)
 
     return rows
