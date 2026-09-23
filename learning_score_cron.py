@@ -143,6 +143,22 @@ view instead of having to rebuild "Placements x Batch" by hand each time:
         View. Fill in either box (or both, or neither for everyone) and
         the matches appear underneath. This is the ".. just fill the batch
         name and user id .." view you asked for.
+      • "LS x Placement Correlation" — correlates learning_score (overall
+        and each latest-month sub-score) against placement outcome, both
+        overall and broken down by batch and by persona bucket. Restricted
+        to students who actually have a row in Placement Corr (i.e. are
+        in/through the placement pipeline) — everyone else has no
+        placement outcome yet, so they're excluded rather than counted as
+        "not placed" (see in_placement_corr in build_student_master_view()).
+      • "Batch x Persona Diagnostic" — automates the "why is one batch
+        doing better" analysis: ranks each sub-metric (attendance/
+        assignment/module contest/project/session) by how strongly its
+        batch-level average tracks learning_score's batch-level average
+        (the "driver"), plus a full batch x persona_bucket breakdown table
+        so persona (student mix) doesn't get mistaken for a real batch
+        effect.
+    All four are computed fresh in Python/pandas every run from whatever's
+    currently in the sheet — nothing here is a one-time snapshot.
   - IMPORTANT re: the placements-sheet boundary from earlier — this reads
     the "Placement Corr" tab, which lives INSIDE this same Learning Score
     sheet (the one you already maintain yourself via IMPORTRANGE). The
@@ -1035,6 +1051,14 @@ def build_student_master_view(sheet, roster):
                        "placement_pipeline_batch", "persona", "persona_bucket"]
     for c in placement_cols:
         df[c] = None
+    # Separate from placement_status: TRUE means this student has a row in
+    # Placement Corr at all (is in/through the placement pipeline), whether
+    # or not they've actually been placed. Without this, "no Placed value"
+    # would be indistinguishable from "not yet placed" vs "hasn't reached
+    # the placement pipeline yet" — build_placement_correlation_view() below
+    # relies on this distinction so it doesn't miscount every not-yet-
+    # eligible student as a placement failure.
+    df["in_placement_corr"] = False
     try:
         pc_values = sheet.worksheet(PLACEMENT_CORR_TAB).get_all_values()
         if not pc_values:
@@ -1065,7 +1089,8 @@ def build_student_master_view(sheet, roster):
             }
         for c in placement_cols:
             df[c] = df["user_id"].map(lambda u, c=c: pc.get(u, {}).get(c))
-        matched = df["user_id"].isin(pc.keys()).sum()
+        df["in_placement_corr"] = df["user_id"].isin(pc.keys())
+        matched = int(df["in_placement_corr"].sum())
         print(f"✓ Matched {matched}/{len(df)} students against '{PLACEMENT_CORR_TAB}' ({len(pc)} rows had a UserID there).")
     except (gspread.exceptions.WorksheetNotFound, ValueError) as e:
         print(f"⚠️  Couldn't read '{PLACEMENT_CORR_TAB}' tab ({e}) — placement/persona columns "
@@ -1077,6 +1102,7 @@ def build_student_master_view(sheet, roster):
     if latest_by_uid is not None:
         ordered_cols += [f"latest ({latest_tab}) {c}" for c in MASTER_VIEW_SUB_SCORE_COLS]
     ordered_cols += placement_cols
+    ordered_cols += ["in_placement_corr"]
     ordered_cols = [c for c in ordered_cols if c in df.columns]
     return df[ordered_cols], ordered_cols
 
@@ -1136,6 +1162,233 @@ def write_lookup_tab(sheet, master_view_df, ordered_cols):
                 print(f"❌ Sheets API error writing {LOOKUP_TAB}: {e}")
                 raise
     raise RuntimeError(f"❌ Failed to write {LOOKUP_TAB} after 5 attempts.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LEARNING SCORE x PLACEMENT CORRELATION + BATCH x PERSONA DIAGNOSTIC — ADDED
+# 2026-09-23. Automates the analysis you were doing by hand in the
+# "Placements x Batch" workbook: correlates learning_score against placement
+# outcome, and breaks batch performance down by persona so you can see which
+# sub-metric (attendance/assignment/module contest/etc.) actually explains
+# why one batch is doing better than another. Pure pandas over this run's
+# Student Master View — no spreadsheet formulas, so nothing to break across
+# tools, and it's always in sync with whatever months/placement data exist.
+# ═══════════════════════════════════════════════════════════════════════════
+CORRELATION_TAB = "LS x Placement Correlation"
+BATCH_DIAGNOSTIC_TAB = "Batch x Persona Diagnostic"
+MIN_GROUP_N = 5  # batches/cohorts smaller than this are shown but excluded from correlation math
+
+
+def _sanitize_cell(v):
+    """gspread's update() JSON-serializes cell values directly — numpy
+    scalar types (int64/float64/bool_) and NaN/inf aren't valid JSON, so
+    every report cell goes through this before being written."""
+    if v is None:
+        return ""
+    if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+        return ""
+    if isinstance(v, np.floating):
+        return "" if np.isnan(v) else float(v)
+    if isinstance(v, np.integer):
+        return int(v)
+    if isinstance(v, np.bool_):
+        return bool(v)
+    if isinstance(v, str) and v.lower() == "nan":
+        return ""
+    return v
+
+
+def _sanitize_rows(rows):
+    return [[_sanitize_cell(c) for c in row] for row in rows]
+
+
+def _corr_n(a, b, min_n=3):
+    """Pearson r between two (possibly messy) series, dropping rows where
+    either side is missing or non-numeric-coercible. Returns (r, n) — r is
+    None if there isn't enough data or either side has no variance (a flat
+    series can't correlate with anything)."""
+    d = pd.DataFrame({"a": pd.to_numeric(a, errors="coerce"), "b": pd.to_numeric(b, errors="coerce")}).dropna()
+    if len(d) < min_n or d["a"].nunique() < 2 or d["b"].nunique() < 2:
+        return None, len(d)
+    r = d["a"].corr(d["b"])
+    return (round(float(r), 3) if pd.notna(r) else None), len(d)
+
+
+def write_blocks_tab(sheet, tab_name, rows):
+    """Writes a jagged list-of-lists report (section headers, blank rows,
+    tables — not a single uniform DataFrame) to a sheet tab, same clear-and-
+    rewrite + rate-limit-retry pattern as write_sheet()."""
+    print(f"🔄 Writing report tab: {tab_name}")
+    rows = _sanitize_rows(rows)
+    n_rows = len(rows)
+    n_cols = max((len(r) for r in rows), default=1)
+    for attempt in range(1, 6):
+        try:
+            time.sleep(2)
+            try:
+                ws = sheet.worksheet(tab_name)
+                ws.clear()
+            except gspread.exceptions.WorksheetNotFound:
+                ws = sheet.add_worksheet(title=tab_name, rows=max(n_rows + 10, 50), cols=max(n_cols + 2, 10))
+            ws.update(range_name="A1", values=rows, value_input_option="USER_ENTERED")
+            print(f"✅ Wrote: {tab_name}")
+            return
+        except gspread.exceptions.APIError as e:
+            if "RESOURCE_EXHAUSTED" in str(e) or "Quota exceeded" in str(e):
+                wait = 60 * attempt
+                print(f"⏳ Rate limit hit, waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"❌ Sheets API error writing {tab_name}: {e}")
+                raise
+    raise RuntimeError(f"❌ Failed to write {tab_name} after 5 attempts.")
+
+
+def build_placement_correlation_view(master_df, ordered_cols):
+    """Correlates learning_score (overall average + latest month + each
+    latest-month sub-score) against placement outcome. Restricted to
+    students who actually have a row in "Placement Corr" (in_placement_corr
+    == True, i.e. are in/through the placement pipeline) — a student with NO
+    row there has an unknown placement status, not a confirmed "not placed",
+    so including them would silently understate the placement rate and
+    dilute the correlation. See build_student_master_view()'s note on
+    in_placement_corr."""
+    rows = [
+        ["LS x PLACEMENT CORRELATION — auto-rebuilt every cron run from this sheet's own data."],
+        ["Restricted to students with a row in 'Placement Corr' (in/through the placement "
+         "pipeline) — everyone else has no placement outcome yet to correlate against."],
+        [],
+    ]
+    if "in_placement_corr" not in master_df.columns:
+        rows.append(["⚠️ 'Placement Corr' wasn't readable this run — nothing to correlate."])
+        return rows
+
+    pool = master_df[master_df["in_placement_corr"] == True].copy()  # noqa: E712
+    if pool.empty:
+        rows.append(["⚠️ No students matched 'Placement Corr' this run — nothing to correlate."])
+        return rows
+
+    pool["is_placed"] = pool["placement_status"].notna().astype(int)
+    month_ls_cols = [c for c in ordered_cols if c.endswith(" LS")]
+    latest_ls_col = month_ls_cols[-1] if month_ls_cols else None
+    sub_cols = [c for c in ordered_cols if c.startswith("latest (")]
+
+    n_pool = len(pool)
+    n_placed = int(pool["is_placed"].sum())
+    rows.append(["OVERALL"])
+    rows.append(["Students in placement pipeline (matched Placement Corr)", n_pool])
+    rows.append(["...of which show any 'Placed' outcome", n_placed])
+    rows.append(["Placement rate", f"{n_placed / n_pool * 100:.1f}%" if n_pool else "n/a"])
+    rows.append([])
+    rows.append(["Correlation with placement (point-biserial r, -1..1 — |r| closer to 1 = stronger link)", "r", "n"])
+    r, n = _corr_n(pool["is_placed"], pool["avg_learning_score"])
+    rows.append(["avg_learning_score (mean across all scored months)", r, n])
+    if latest_ls_col:
+        r, n = _corr_n(pool["is_placed"], pool[latest_ls_col])
+        rows.append([latest_ls_col, r, n])
+    for c in sub_cols:
+        r, n = _corr_n(pool["is_placed"], pool[c])
+        rows.append([c, r, n])
+
+    rows.append([])
+    rows.append([f"BY BATCH — batches with fewer than {MIN_GROUP_N} placement-pipeline students are "
+                  "shown here but excluded from the correlation line below"])
+    rows.append(["batch", "n_in_pipeline", "n_placed", "placement_rate_%", "avg_learning_score"])
+    batch_g = pool.groupby("batch", dropna=False).agg(
+        n_in_pipeline=("user_id", "count"),
+        n_placed=("is_placed", "sum"),
+        avg_learning_score=("avg_learning_score", "mean"),
+    ).reset_index()
+    batch_g["placement_rate_%"] = (batch_g["n_placed"] / batch_g["n_in_pipeline"] * 100).round(1)
+    batch_g["avg_learning_score"] = batch_g["avg_learning_score"].round(1)
+    batch_g = batch_g.sort_values("placement_rate_%", ascending=False)
+    for _, r_ in batch_g.iterrows():
+        rows.append([r_["batch"], int(r_["n_in_pipeline"]), int(r_["n_placed"]), r_["placement_rate_%"], r_["avg_learning_score"]])
+    reliable = batch_g[batch_g["n_in_pipeline"] >= MIN_GROUP_N]
+    r, n = _corr_n(reliable["placement_rate_%"], reliable["avg_learning_score"])
+    rows.append([])
+    rows.append([f"Batch-level correlation — placement rate vs avg learning score ({n} batches, n>={MIN_GROUP_N} each)", r])
+
+    rows.append([])
+    rows.append(["BY PERSONA BUCKET"])
+    rows.append(["persona_bucket", "n_in_pipeline", "n_placed", "placement_rate_%", "avg_learning_score"])
+    persona_g = pool.groupby("persona_bucket", dropna=False).agg(
+        n_in_pipeline=("user_id", "count"),
+        n_placed=("is_placed", "sum"),
+        avg_learning_score=("avg_learning_score", "mean"),
+    ).reset_index()
+    persona_g["placement_rate_%"] = (persona_g["n_placed"] / persona_g["n_in_pipeline"] * 100).round(1)
+    persona_g["avg_learning_score"] = persona_g["avg_learning_score"].round(1)
+    persona_g = persona_g.sort_values("placement_rate_%", ascending=False)
+    for _, r_ in persona_g.iterrows():
+        label = r_["persona_bucket"] if pd.notna(r_["persona_bucket"]) else "(no persona data)"
+        rows.append([label, int(r_["n_in_pipeline"]), int(r_["n_placed"]), r_["placement_rate_%"], r_["avg_learning_score"]])
+
+    return rows
+
+
+def build_batch_diagnostic_view(master_df, ordered_cols):
+    """Two-part report: (1) which sub-metric's batch-to-batch variation
+    tracks learning_score's batch-to-batch variation most closely (the
+    "driver" — e.g. attendance vs assignment vs module contest), computed
+    both at student-level and batch-level; (2) a batch x persona_bucket
+    breakdown of learning_score and every sub-metric, so you can eyeball
+    whether a batch is under-performing across the board or specifically on
+    one sub-metric, with persona held constant."""
+    rows = [
+        ["BATCH x PERSONA DIAGNOSTIC — auto-rebuilt every cron run from this sheet's own data."],
+        ["Which sub-metric explains batch-to-batch differences in learning_score, and the same "
+         "breakdown by persona so student mix doesn't get mistaken for a real batch effect."],
+        [],
+    ]
+    month_ls_cols = [c for c in ordered_cols if c.endswith(" LS")]
+    latest_ls_col = month_ls_cols[-1] if month_ls_cols else None
+    sub_cols = [c for c in ordered_cols if c.startswith("latest (")]
+    if not latest_ls_col or not sub_cols:
+        rows.append(["⚠️ Not enough month/sub-score data yet to compute this."])
+        return rows
+
+    df = master_df.dropna(subset=[latest_ls_col]).copy()
+    if df.empty:
+        rows.append(["⚠️ No students have a learning_score for the latest month — nothing to compare."])
+        return rows
+
+    batch_n = df.groupby("batch", dropna=False)["user_id"].count()
+    reliable_batches = batch_n[batch_n >= MIN_GROUP_N].index
+    df_reliable = df[df["batch"].isin(reliable_batches)]
+    batch_means = df_reliable.groupby("batch", dropna=False)[[latest_ls_col] + sub_cols].mean()
+
+    rows.append(["DRIVER CORRELATIONS — ranked by |batch-level r|, i.e. which sub-metric moves "
+                  "together with learning_score ACROSS batches (not just within one student)"])
+    rows.append(["sub_metric", "student-level r", "n", "batch-level r", "n_batches"])
+    driver_rows = []
+    for c in sub_cols:
+        r_student, n_student = _corr_n(df[c], df[latest_ls_col])
+        r_batch, n_batch = _corr_n(batch_means[c], batch_means[latest_ls_col]) if c in batch_means.columns else (None, 0)
+        driver_rows.append((c, r_student, n_student, r_batch, n_batch))
+    driver_rows.sort(key=lambda t: abs(t[3]) if t[3] is not None else -1, reverse=True)
+    for c, rs, ns, rb, nb in driver_rows:
+        rows.append([c, rs, ns, rb, nb])
+    rows.append([])
+    rows.append([f"(batch-level uses batches with >= {MIN_GROUP_N} students this latest month — {len(reliable_batches)} batches)"])
+
+    rows.append([])
+    rows.append(["BATCH x PERSONA BREAKDOWN (latest month)"])
+    rows.append(["batch", "persona_bucket", "n", latest_ls_col] + sub_cols)
+    grp = df.groupby(["batch", "persona_bucket"], dropna=False).agg(
+        n=("user_id", "count"),
+        **{latest_ls_col: (latest_ls_col, "mean")},
+        **{c: (c, "mean") for c in sub_cols},
+    ).reset_index()
+    grp = grp.sort_values(["batch", "n"], ascending=[True, False])
+    for _, r_ in grp.iterrows():
+        persona_label = r_["persona_bucket"] if pd.notna(r_["persona_bucket"]) else "(no persona data)"
+        row = [r_["batch"], persona_label, int(r_["n"]),
+               round(r_[latest_ls_col], 1) if pd.notna(r_[latest_ls_col]) else None]
+        row += [round(r_[c], 1) if pd.notna(r_[c]) else None for c in sub_cols]
+        rows.append(row)
+
+    return rows
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1232,8 +1485,14 @@ if __name__ == "__main__":
         if master_df is not None:
             write_sheet(LEARNING_SCORE_SHEET_KEY, MASTER_VIEW_TAB, master_df)
             write_lookup_tab(sheet_obj, master_df, ordered_cols)
+
+            correlation_rows = build_placement_correlation_view(master_df, ordered_cols)
+            write_blocks_tab(sheet_obj, CORRELATION_TAB, correlation_rows)
+
+            diagnostic_rows = build_batch_diagnostic_view(master_df, ordered_cols)
+            write_blocks_tab(sheet_obj, BATCH_DIAGNOSTIC_TAB, diagnostic_rows)
     except Exception:
-        print("\n⚠️  Student Master View / Lookup build failed (non-fatal — "
+        print("\n⚠️  Student Master View / Lookup / Correlation build failed (non-fatal — "
               "per-month scoring above already succeeded):")
         traceback.print_exc()
 
