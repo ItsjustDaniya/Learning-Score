@@ -204,6 +204,14 @@ view instead of having to rebuild "Placements x Batch" by hand each time:
             operationally. Uses each month's OWN recorded batch per student
             (not the current roster batch), so a rare batch transfer
             doesn't misattribute history.
+      • "User x Batch x Persona Diagnostic" — ADDED 2026-09-24: the
+        per-STUDENT version of "Batch x Persona Diagnostic". One row per
+        student, name right next to their batch + persona (raw and
+        bucketed), plus the same performance_vs_avg/top_strength/watch_out
+        verdict — benchmarked against the overall average of students in
+        reliable-sized batches, not just that one student's own tiny
+        batch+persona cell. This is the sheet to open when you want to look
+        up an individual student, not just their group.
     All of the above are computed fresh in Python/pandas every run from
     whatever's currently in the sheet — nothing here is a one-time snapshot.
   - IMPORTANT re: the placements-sheet boundary from earlier — this reads
@@ -1906,6 +1914,56 @@ def build_batch_diagnostic_view(master_df, ordered_cols, batch_monthly_df=None, 
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# USER x BATCH x PERSONA DIAGNOSTIC — ADDED 2026-09-24. Per-STUDENT version
+# of "Batch x Persona Diagnostic": every row IS a student (not a group
+# average), carrying their batch and persona right next to their name, plus
+# the same performance_vs_avg/top_strength/watch_out verdict so you can look
+# up any one student and immediately see where they stand and why — not
+# just the batch/persona they belong to.
+# ═══════════════════════════════════════════════════════════════════════════
+USER_DIAGNOSTIC_TAB = "User x Batch x Persona Diagnostic"
+
+
+def build_user_diagnostic_view(master_df, ordered_cols):
+    """One row per student — user_id, student_name, batch, persona +
+    persona_bucket, the latest month's learning_score and every sub-metric
+    (including the per-module breakdowns, same columns as Student Master
+    View), then performance_vs_avg/top_strength/watch_out.
+
+    Benchmarked against the OVERALL average of students in reliable-sized
+    batches (n >= MIN_GROUP_N) — NOT against just that student's own batch x
+    persona cell, which for most students would mean comparing against a
+    literal handful of peers and producing noisy, overconfident verdicts.
+    Returns a DataFrame, or a one-row DataFrame with a "note" explaining why
+    if there isn't enough data yet — write_sheet() handles either shape."""
+    month_ls_cols = [c for c in ordered_cols if c.endswith(" LS")]
+    latest_ls_col = month_ls_cols[-1] if month_ls_cols else None
+    sub_cols = [c for c in ordered_cols if c.startswith("latest (")]
+    id_cols = [c for c in ["user_id", "student_name", "email", "batch", "label", "gem_label",
+                            "persona", "persona_bucket"] if c in master_df.columns]
+
+    if not latest_ls_col or not sub_cols:
+        return pd.DataFrame([{"note": "Not enough month/sub-score data yet to compute this."}])
+
+    df = master_df.dropna(subset=[latest_ls_col]).copy()
+    if df.empty:
+        return pd.DataFrame([{"note": "No students have a learning_score for the latest month."}])
+
+    batch_n = df.groupby("batch", dropna=False)["user_id"].count()
+    reliable_batches = batch_n[batch_n >= MIN_GROUP_N].index
+    df_reliable = df[df["batch"].isin(reliable_batches)]
+    benchmarks = {c: df_reliable[c].mean() for c in sub_cols}
+    benchmarks["_ls"] = df_reliable[latest_ls_col].mean()
+
+    perf, strength, watch = _summarize_rows(df, sub_cols, latest_ls_col, benchmarks)
+    out = df[id_cols + [latest_ls_col] + sub_cols].copy()
+    out["performance_vs_avg"] = perf
+    out["top_strength"] = strength
+    out["watch_out"] = watch
+    return out.sort_values(latest_ls_col, ascending=False)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
 def score_month(y, m, tab_name, roster):
@@ -2007,6 +2065,9 @@ if __name__ == "__main__":
 
             diagnostic_rows = build_batch_diagnostic_view(master_df, ordered_cols, batch_monthly_df, persona_monthly_df)
             write_blocks_tab(sheet_obj, BATCH_DIAGNOSTIC_TAB, diagnostic_rows)
+
+            user_diag_df = build_user_diagnostic_view(master_df, ordered_cols)
+            write_sheet(LEARNING_SCORE_SHEET_KEY, USER_DIAGNOSTIC_TAB, user_diag_df)
     except Exception:
         print("\n⚠️  Student Master View / Lookup / Correlation build failed (non-fatal — "
               "per-month scoring above already succeeded):")
