@@ -214,6 +214,22 @@ view instead of having to rebuild "Placements x Batch" by hand each time:
         up an individual student, not just their group.
     All of the above are computed fresh in Python/pandas every run from
     whatever's currently in the sheet — nothing here is a one-time snapshot.
+
+FIXED 2026-09-24 — a real GitHub Actions run failed the whole prefetch on one
+slow fetch of card #11636 (attendance): "⏱️ Timed out fetching card 11636
+after 480s". Two separate problems, both fixed:
+  1. metabase_request() retried on a connection error / transient 400, but a
+     bare requests.Timeout was raised immediately with NO retry at all — one
+     slow attempt killed the entire run. Timeouts now get the same
+     backoff-and-retry treatment as the other transient failures.
+  2. Card #11636 is fetched ALL-TIME (one row per user per lecture, across
+     every batch — filtered down to the target month client-side, see
+     build_attendance()), making it the single biggest payload in
+     REQUIRED_CARDS — bigger than #7577, which alone took 261s. 480s was
+     just not enough headroom for it. Added CARD_TIMEOUTS (a per-card
+     timeout override, default stays 480s) and gave #11636 1200s (20 min).
+  Both changes are additive — every other card keeps the same 480s timeout
+  and same retry behavior as before.
   - IMPORTANT re: the placements-sheet boundary from earlier — this reads
     the "Placement Corr" tab, which lives INSIDE this same Learning Score
     sheet (the one you already maintain yourself via IMPORTRANGE). The
@@ -390,6 +406,19 @@ REQUIRED_CARDS = [
     GROOMING_SESSIONS_CARD,
 ]
 
+# Per-card timeout overrides (seconds) — the default (see metabase_request())
+# is 480s, which is plenty for every REQUIRED_CARDS entry except attendance.
+# ATTENDANCE_CARD (#11636) is fetched ALL-TIME, one row per user per lecture
+# across every batch (client-side filtered to the target month afterwards,
+# see build_attendance()) — it's the single biggest payload of the bunch, and
+# a real 2026-09-24 run timed it out at 480s with no retry (a bare
+# requests.Timeout wasn't being retried at all — see the fix in
+# metabase_request() below). Giving it real headroom here instead of just
+# retrying blindly into the same wall.
+CARD_TIMEOUTS = {
+    ATTENDANCE_CARD: 1200,
+}
+
 # Module labels as they appear in the Learning Score sheet -> module_name
 # values as they appear in Metabase (confirmed via calculate_total_score()
 # in your Module_contest pipeline — the order/naming lines up almost exactly).
@@ -499,7 +528,24 @@ def metabase_request(card_id, label=None, timeout=480, max_conn_retries=5,
         try:
             res = SESSION.post(url, headers=METABASE_HEADERS, json=body, timeout=timeout)
         except requests.exceptions.Timeout:
-            raise RuntimeError(f"⏱️ Timed out fetching {label} after {timeout}s ({url}).")
+            # FIXED 2026-09-24: this used to raise immediately on the very
+            # first timeout, with none of the retry/backoff below applied —
+            # a real run hit this on card #11636 (attendance, the biggest
+            # all-time payload of the bunch) and killed the whole prefetch on
+            # one slow attempt. A timeout can be a one-off (query queued
+            # behind other load, same as the connection-error/transient-400
+            # cases already retried here) rather than proof the query itself
+            # can't finish, so it now gets the same backoff-and-retry
+            # treatment instead of failing fast. See CARD_TIMEOUTS above for
+            # giving a genuinely slow card more time per attempt too.
+            elapsed = time.time() - t0
+            if attempt == max_conn_retries:
+                raise RuntimeError(f"⏱️ Timed out fetching {label} after {timeout}s, "
+                                    f"{max_conn_retries} attempt(s) ({url}).")
+            print(f"⏱️  Timed out after {elapsed:.1f}s (limit {timeout}s) — retrying in {backoff}s...")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, max_conn_backoff)
+            continue
         except requests.exceptions.ConnectionError as e:
             elapsed = time.time() - t0
             if attempt == max_conn_retries:
@@ -530,8 +576,9 @@ def fetch_card(card_id, label=None, optional=False, parameters=None):
     if cache_key in _card_cache:
         print(f"↺ Reusing cached {label}")
         return _card_cache[cache_key]
+    kwargs = {"timeout": CARD_TIMEOUTS[card_id]} if card_id in CARD_TIMEOUTS else {}
     try:
-        res = metabase_request(card_id, label, parameters=parameters)
+        res = metabase_request(card_id, label, parameters=parameters, **kwargs)
         data = res.json()
     except (RuntimeError, requests.exceptions.JSONDecodeError) as e:
         if optional:
